@@ -79,9 +79,6 @@ pub struct Store {
     /// self-heal rollback of `messages` left untrusted (see
     /// [`Store::heal_purge_pending`]).
     heal_chains_purged: std::sync::atomic::AtomicBool,
-    /// How many of the handle's self-heals the erased-row check has covered
-    /// (see [`Store::report_erased_rows_after_heal`]).
-    heals_checked: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,17 +395,14 @@ impl Store {
     /// [`Store::open_with_options`] instead so the same options flow into
     /// every dataset open and write.
     pub async fn open(location: &Url) -> Result<Self> {
-        let store = Self {
+        Ok(Self {
             handle: Handle::open(location).await?,
             rowmap: ArcSwapOption::empty(),
             sync_oracle_map: ArcSwapOption::empty(),
             embedder: None,
             ingest_embed_progress: None,
             heal_chains_purged: std::sync::atomic::AtomicBool::new(false),
-            heals_checked: std::sync::atomic::AtomicUsize::new(0),
-        };
-        store.report_erased_rows_after_heal().await;
-        Ok(store)
+        })
     }
 
     /// Attach a resident embedder so [`Store::upsert_session_batch`] embeds
@@ -444,17 +438,14 @@ impl Store {
         storage_options: std::collections::HashMap<String, String>,
         caps: crate::substrate::RuntimeCaps,
     ) -> Result<Self> {
-        let store = Self {
+        Ok(Self {
             handle: Handle::open_with_options(location, storage_options, caps).await?,
             rowmap: ArcSwapOption::empty(),
             sync_oracle_map: ArcSwapOption::empty(),
             embedder: None,
             ingest_embed_progress: None,
             heal_chains_purged: std::sync::atomic::AtomicBool::new(false),
-            heals_checked: std::sync::atomic::AtomicUsize::new(0),
-        };
-        store.report_erased_rows_after_heal().await;
-        Ok(store)
+        })
     }
 
     /// Like [`Self::open_with_options`], plus the on-disk `_indices/*` cache
@@ -465,7 +456,7 @@ impl Store {
         caps: crate::substrate::RuntimeCaps,
         index_cache_dir: Option<std::path::PathBuf>,
     ) -> Result<Self> {
-        let store = Self {
+        Ok(Self {
             handle: Handle::open_with_options_cached(
                 location,
                 storage_options,
@@ -478,10 +469,7 @@ impl Store {
             embedder: None,
             ingest_embed_progress: None,
             heal_chains_purged: std::sync::atomic::AtomicBool::new(false),
-            heals_checked: std::sync::atomic::AtomicUsize::new(0),
-        };
-        store.report_erased_rows_after_heal().await;
-        Ok(store)
+        })
     }
 
     /// Convenience for tests and CLI verbs holding a `&Path`: wraps the path in
@@ -2197,7 +2185,6 @@ impl Store {
     /// (spec.md#session-append-only-exception). Both configs ride on manifests
     /// the handle already holds, so this costs no request of its own.
     pub async fn erased_session_ids(&self) -> Result<HashSet<String>> {
-        self.report_erased_rows_after_heal().await;
         Ok(erase::intent_ids(&self.erase_intent().await?))
     }
 
@@ -2240,63 +2227,6 @@ impl Store {
     pub async fn copy_erase_intent_from(&self, source: &Store) -> Result<usize> {
         self.import_erase_intent(&source.erase_intent().await?)
             .await
-    }
-
-    /// After any self-heal, check whether the rollback brought back rows of
-    /// sessions this store has erased, and name the repair. Read-only (one
-    /// indexed scan per table, only when a heal happened), so safe under the
-    /// MCP read-only carve-out (spec.md#mcp-read-only-heal-exception).
-    async fn report_erased_rows_after_heal(&self) {
-        let heals = self.handle.healed_tables().len();
-        if heals
-            <= self
-                .heals_checked
-                .swap(heals, std::sync::atomic::Ordering::Relaxed)
-        {
-            return;
-        }
-        let returned = self.erased_sessions_with_rows().await;
-        match returned {
-            Ok(returned) if !returned.is_empty() => {
-                let ids = returned.into_iter().collect::<Vec<_>>().join(" ");
-                tracing::warn!(
-                    "pond self-heal rolled back past an erase: erased sessions have rows again. Run `pond erase {ids}` to purge them"
-                );
-            }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(%error, "could not check erased sessions after a self-heal");
-            }
-        }
-    }
-
-    /// Erased session ids that still have rows in any table - empty in steady
-    /// state; non-empty after a rollback, a racing write or a pre-erase binary.
-    async fn erased_sessions_with_rows(&self) -> Result<BTreeSet<String>> {
-        let erased = erase::intent_ids(&self.erase_intent().await?);
-        if erased.is_empty() {
-            return Ok(BTreeSet::new());
-        }
-        let values: Vec<ScalarValue> = erased.into_iter().map(ScalarValue::String).collect();
-        let mut returned = BTreeSet::new();
-        for (table, column) in [
-            (Table::Sessions, "id"),
-            (Table::Messages, "session_id"),
-            (Table::Parts, "session_id"),
-        ] {
-            let batch = self
-                .handle
-                .scan_batch(
-                    table,
-                    Some(&Predicate::In(column, values.clone())),
-                    &[column],
-                )
-                .await?;
-            for row in 0..batch.num_rows() {
-                returned.extend(string(&batch, column, row)?);
-            }
-        }
-        Ok(returned)
     }
 
     /// Whether local self-heal rolled `messages` back when this store opened.
@@ -11306,8 +11236,8 @@ mod tests {
         assert!(store.child_sessions("parent").await?.is_empty());
         assert!(store.find_session("parent").await?.is_some());
         assert_eq!(
-            store.erased_sessions_with_rows().await?,
-            BTreeSet::from(["child".to_owned()]),
+            store.handle.count_rows(Table::Sessions).await?,
+            2,
             "the rows are still there, only suppressed",
         );
         Ok(())
