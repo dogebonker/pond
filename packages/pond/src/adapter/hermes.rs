@@ -73,8 +73,9 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id,
+    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture,
+    EdgeFidelity, Env, LineageFidelity, RestoreFidelity, RestoredFile, SkipOracle, SkipReason,
+    by_timestamp_then_id,
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_str, json_or_string},
     extracted_text, is_session_fresh, jsonl_bytes, part_id, part_ordinal, raw_record,
     source_options,
@@ -186,6 +187,17 @@ pub struct HermesFactory;
 impl AdapterFactory for HermesFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // A missing parent row or `end_reason` degrades a continuation to a spawn branded
+    // `hermes/subagent` (and the cron override brands branch or compaction children
+    // `hermes/cron`), so a spawn brand does not prove a spawn.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::Complete,
+            continuations: EdgeFidelity::Partial,
+            spawn_brand_exact: false,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
@@ -1667,6 +1679,18 @@ mod tests {
             second.pointer("/row/content").and_then(Value::as_str),
             Some("q"),
             "messages restore in source id order",
+        );
+    }
+
+    #[test]
+    fn declares_its_lineage_fidelity() {
+        assert_eq!(
+            HermesFactory.lineage_fidelity(),
+            LineageFidelity {
+                spawns: EdgeFidelity::Complete,
+                continuations: EdgeFidelity::Partial,
+                spawn_brand_exact: false,
+            }
         );
     }
 }

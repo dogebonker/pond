@@ -58,8 +58,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SourceWatermark, config_path,
+    Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, EdgeFidelity, Env,
+    LineageFidelity, RestoreFidelity, RestoredFile, SkipOracle, SourceWatermark, config_path,
     jsonl::{
         BoundedRow, JsonlTree, jsonl_tree_discover, jsonl_tree_events, jsonl_tree_plan,
         peek_last_line, peek_nth_line,
@@ -107,6 +107,16 @@ pub struct OhMyPiFactory;
 impl AdapterFactory for OhMyPiFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // A `/tan` fork is branded `oh-my-pi/subagent` like a real spawn, so the brand does not
+    // prove a spawn; continuations have no separate record.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::Complete,
+            continuations: EdgeFidelity::None,
+            spawn_brand_exact: false,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
@@ -911,5 +921,17 @@ mod tests {
             .serialize(&session, RestoreFidelity::Native)
             .expect_err("serialize stays an error, not a panic");
         assert!(error.to_string().contains(reason), "both surfaces agree");
+    }
+
+    #[test]
+    fn declares_its_lineage_fidelity() {
+        assert_eq!(
+            OhMyPiFactory.lineage_fidelity(),
+            LineageFidelity {
+                spawns: EdgeFidelity::Complete,
+                continuations: EdgeFidelity::None,
+                spawn_brand_exact: false,
+            }
+        );
     }
 }

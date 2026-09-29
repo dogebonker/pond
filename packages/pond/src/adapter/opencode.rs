@@ -47,9 +47,9 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id, compact_json,
-    config_path,
+    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture,
+    EdgeFidelity, Env, LineageFidelity, RestoreFidelity, RestoredFile, SkipOracle, SkipReason,
+    by_timestamp_then_id, compact_json, config_path,
     extract::{Extracted, extract_str, json_or_string},
     jsonl::{RECORD_CAP, parse_bounded},
     part_id, part_ordinal, raw_record, source_options,
@@ -66,6 +66,16 @@ pub struct OpencodeFactory;
 impl AdapterFactory for OpencodeFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // DB-era children are branded `opencode/<agent>`, tree-era children keep the root brand
+    // (so classify as continuations); continuations are not recorded as a distinct kind.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::Partial,
+            continuations: EdgeFidelity::None,
+            spawn_brand_exact: true,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
@@ -3270,5 +3280,17 @@ mod tests {
             }),
         )?;
         Ok(())
+    }
+
+    #[test]
+    fn declares_its_lineage_fidelity() {
+        assert_eq!(
+            OpencodeFactory.lineage_fidelity(),
+            LineageFidelity {
+                spawns: EdgeFidelity::Partial,
+                continuations: EdgeFidelity::None,
+                spawn_brand_exact: true,
+            }
+        );
     }
 }

@@ -67,9 +67,9 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, SourceWatermark, SyncPlan,
-    by_timestamp_then_id, compact_json, empty_options, expand_home,
+    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture,
+    EdgeFidelity, Env, LineageFidelity, RestoreFidelity, RestoredFile, SkipOracle, SkipReason,
+    SourceWatermark, SyncPlan, by_timestamp_then_id, compact_json, empty_options, expand_home,
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_str},
     extracted_text, is_session_fresh,
     jsonl::{
@@ -100,6 +100,16 @@ pub struct PiCodingAgentFactory;
 impl AdapterFactory for PiCodingAgentFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // Parented children keep the root brand, so no edge ever classifies as a spawn;
+    // continuations link through `parentSessionId`.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::None,
+            continuations: EdgeFidelity::Complete,
+            spawn_brand_exact: false,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
@@ -483,6 +493,7 @@ impl Adapter for PiCodingAgentAdapter {
                 sessions: files.sessions + db.sessions,
                 fresh: files.fresh + db.fresh,
                 pending: files.pending + db.pending,
+                erased: files.erased + db.erased,
             }))
         })
     }
@@ -2706,5 +2717,17 @@ mod tests {
         }
         std::fs::write(path, jsonl_bytes(NAME, records)?)?;
         Ok(())
+    }
+
+    #[test]
+    fn declares_its_lineage_fidelity() {
+        assert_eq!(
+            PiCodingAgentFactory.lineage_fidelity(),
+            LineageFidelity {
+                spawns: EdgeFidelity::None,
+                continuations: EdgeFidelity::Complete,
+                spawn_brand_exact: false,
+            }
+        );
     }
 }

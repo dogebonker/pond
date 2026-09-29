@@ -31,9 +31,9 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, Env, PlanFuture,
-    RestoreFidelity, RestoredFile, SkipOracle, SourceWatermark, by_timestamp_then_id, config_path,
-    empty_options,
+    Adapter, AdapterError, AdapterFactory, AdapterYieldStream, DiscoverFuture, EdgeFidelity, Env,
+    LineageFidelity, PlanFuture, RestoreFidelity, RestoredFile, SkipOracle, SourceWatermark,
+    by_timestamp_then_id, config_path, empty_options,
     extract::{extract_self_str, extract_str},
     extracted_text,
     jsonl::{
@@ -67,6 +67,15 @@ pub struct GrokBuildFactory;
 impl AdapterFactory for GrokBuildFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // Subagents are branded; continuation recording is unverified, so declared absent.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::Complete,
+            continuations: EdgeFidelity::None,
+            spawn_brand_exact: true,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
@@ -1370,5 +1379,17 @@ mod tests {
             "every typed message survives"
         );
         Ok(())
+    }
+
+    #[test]
+    fn declares_its_lineage_fidelity() {
+        assert_eq!(
+            GrokBuildFactory.lineage_fidelity(),
+            LineageFidelity {
+                spawns: EdgeFidelity::Complete,
+                continuations: EdgeFidelity::None,
+                spawn_brand_exact: true,
+            }
+        );
     }
 }

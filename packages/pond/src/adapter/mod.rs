@@ -93,6 +93,12 @@ pub trait AdapterFactory: Send + Sync {
     /// that need explicit creds) return `None`.
     fn probe_default(&self, env: &Env) -> Option<Value>;
 
+    /// How completely and how exactly this adapter records session lineage.
+    /// Required, not defaulted: erase cascades only over edges an adapter
+    /// vouches for (spec.md#session-append-only-exception), so every adapter
+    /// states its own gaps.
+    fn lineage_fidelity(&self) -> LineageFidelity;
+
     /// `None` when this factory can restore; `Some(reason)` when it is
     /// ingest-only, and the reason names the caller's alternative.
     ///
@@ -111,6 +117,30 @@ pub trait AdapterFactory: Send + Sync {
         session: &SessionWithMessages,
         fidelity: RestoreFidelity,
     ) -> Result<Vec<RestoredFile>, AdapterError>;
+}
+
+/// How much of one edge kind an adapter records as `parent_session_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeFidelity {
+    /// Every edge of this kind the source states is recorded.
+    Complete,
+    /// Some are recorded; sessions linked this way may exist unrecorded.
+    Partial,
+    /// None are recorded.
+    None,
+}
+
+/// An adapter's lineage declaration (see [`AdapterFactory::lineage_fidelity`]).
+/// `spawns` covers spawned children (sub-agents); `continuations` covers
+/// resumes, forks, branches and compaction successors. `spawn_brand_exact`
+/// vouches that a child carrying this adapter's `/`-subpath spawn brand is
+/// always a real spawn, never a misbranded continuation - the one property
+/// that lets an edge cascade without an explicit operator flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineageFidelity {
+    pub spawns: EdgeFidelity,
+    pub continuations: EdgeFidelity,
+    pub spawn_brand_exact: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +230,9 @@ pub struct SyncPlan {
     pub sessions: usize,
     pub fresh: usize,
     pub pending: usize,
+    /// Sessions the store has erased: skipped undecoded, counted apart from
+    /// `fresh` because they will never sync again.
+    pub erased: usize,
 }
 
 impl SyncPlan {
@@ -214,7 +247,9 @@ impl SyncPlan {
         let mut plan = Self::default();
         for (session_id, watermark) in heads {
             plan.sessions += 1;
-            if source_in_sync(oracle, session_id, watermark) {
+            if session_id.is_some_and(|id| oracle.is_erased(id)) {
+                plan.erased += 1;
+            } else if source_in_sync(oracle, session_id, watermark) {
                 plan.fresh += 1;
             } else {
                 plan.pending += 1;
@@ -299,21 +334,51 @@ pub trait SkipOracle: Send + Sync {
     fn is_empty(&self) -> bool {
         false
     }
+
+    /// Whether the store has erased `session_id`
+    /// (spec.md#session-append-only-exception). An optimization only: ingest
+    /// drops an erased session's rows whatever the oracle says.
+    fn is_erased(&self, _session_id: &str) -> bool {
+        false
+    }
 }
 
 /// Seam decision rule - the only place the freshness comparison lives. A session
 /// is fresh (skip the re-decode) iff the source's latest message timestamp is no
-/// newer than pond's stored watermark. A missing signal on either side is never
-/// fresh.
+/// newer than pond's stored watermark, or the store has erased it - its rows
+/// would be dropped at ingest, so decoding them is waste. A missing signal on
+/// either side is never fresh.
 pub fn is_session_fresh(
     oracle: &dyn SkipOracle,
     session_id: &str,
     source_last_ts_micros: Option<i64>,
 ) -> bool {
-    matches!(
-        (oracle.session_max_ts(session_id), source_last_ts_micros),
-        (Some(stored), Some(source)) if source <= stored
-    )
+    oracle.is_erased(session_id)
+        || matches!(
+            (oracle.session_max_ts(session_id), source_last_ts_micros),
+            (Some(stored), Some(source)) if source <= stored
+        )
+}
+
+/// Any [`SkipOracle`] plus the store's erased ids - how a sync hands the
+/// freshness gate its denylist whichever watermark source it settled on.
+pub struct ErasedOracle {
+    pub inner: Box<dyn SkipOracle>,
+    pub erased: std::collections::HashSet<String>,
+}
+
+impl SkipOracle for ErasedOracle {
+    fn session_max_ts(&self, session_id: &str) -> Option<i64> {
+        self.inner.session_max_ts(session_id)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    fn is_erased(&self, session_id: &str) -> bool {
+        self.erased.contains(session_id)
+    }
 }
 
 /// `SkipOracle` that always returns `None`. Used by `--verify`, tests, and
@@ -916,7 +981,62 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{RestoreFidelity, RestoredFile, validate_path_id, write_restored_files};
+    use super::{
+        ErasedOracle, NoopOracle, RestoreFidelity, RestoredFile, SkipOracle, SourceWatermark,
+        SyncPlan, is_session_fresh, validate_path_id, write_restored_files,
+    };
+
+    struct Watermarks(std::collections::HashMap<&'static str, i64>);
+
+    impl SkipOracle for Watermarks {
+        fn session_max_ts(&self, session_id: &str) -> Option<i64> {
+            self.0.get(session_id).copied()
+        }
+    }
+
+    fn erased_over(inner: Box<dyn SkipOracle>, erased: &[&str]) -> ErasedOracle {
+        ErasedOracle {
+            inner,
+            erased: erased.iter().map(|id| (*id).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn is_session_fresh_skips_erased_ids_undecoded() {
+        let oracle = erased_over(Box::new(Watermarks([("kept", 10)].into())), &["gone"]);
+        // No watermark and no source signal: an erased id still skips.
+        assert!(is_session_fresh(&oracle, "gone", None));
+        assert!(is_session_fresh(&oracle, "kept", Some(10)));
+        assert!(!is_session_fresh(&oracle, "kept", Some(11)));
+        assert!(!is_session_fresh(&oracle, "never-seen", Some(1)));
+        // The wrapper never makes an empty oracle look populated.
+        assert!(erased_over(Box::new(NoopOracle), &["gone"]).is_empty());
+    }
+
+    #[test]
+    fn sync_plan_counts_erased_sessions_apart_from_fresh() {
+        let oracle = erased_over(
+            Box::new(Watermarks([("kept", 10), ("gone", 10)].into())),
+            &["gone"],
+        );
+        let plan = SyncPlan::from_heads(
+            &oracle,
+            [
+                (Some("kept"), SourceWatermark::At(10)),
+                (Some("gone"), SourceWatermark::At(99)),
+                (Some("new"), SourceWatermark::At(1)),
+            ],
+        );
+        assert_eq!(
+            plan,
+            SyncPlan {
+                sessions: 3,
+                fresh: 1,
+                pending: 1,
+                erased: 1,
+            }
+        );
+    }
 
     #[test]
     fn validate_path_id_refuses_windows_hostile_segments() {

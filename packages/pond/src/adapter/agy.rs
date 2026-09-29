@@ -35,9 +35,9 @@ use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    PlanFuture, RestoreFidelity, RestoredFile, SkipOracle, SkipReason, SourceWatermark, SyncPlan,
-    config_path,
+    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture,
+    EdgeFidelity, Env, LineageFidelity, PlanFuture, RestoreFidelity, RestoredFile, SkipOracle,
+    SkipReason, SourceWatermark, SyncPlan, config_path,
     extract::{Extracted, extract_self_str, extract_str, extract_value, json_or_string},
     part_id, part_ordinal, source_in_sync, source_options,
     sqlite::{self, CHANNEL_CAP, emit, has_table},
@@ -132,6 +132,16 @@ pub struct AgyFactory;
 impl AdapterFactory for AgyFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // Subagents name their parent in their metadata (`agy/subagent`); forks record parent and
+    // cut point under the root brand.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::Complete,
+            continuations: EdgeFidelity::Complete,
+            spawn_brand_exact: true,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
@@ -2624,5 +2634,17 @@ mod tests {
         assert_eq!(run.errors.len(), 1, "{:?}", run.errors);
         assert!(run.errors[0].contains("steps/1"), "{}", run.errors[0]);
         assert_eq!(step_messages(session(&run, CLI_NO_WORKSPACE)).len(), 1);
+    }
+
+    #[test]
+    fn declares_its_lineage_fidelity() {
+        assert_eq!(
+            AgyFactory.lineage_fidelity(),
+            LineageFidelity {
+                spawns: EdgeFidelity::Complete,
+                continuations: EdgeFidelity::Complete,
+                spawn_brand_exact: true,
+            }
+        );
     }
 }

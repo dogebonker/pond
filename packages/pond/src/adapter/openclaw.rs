@@ -138,8 +138,9 @@ use crate::{
 };
 
 use super::{
-    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture, Env,
-    RestoreFidelity, RestoredFile, SkipOracle, SkipReason, by_timestamp_then_id, expand_home,
+    Adapter, AdapterError, AdapterFactory, AdapterYield, AdapterYieldStream, DiscoverFuture,
+    EdgeFidelity, Env, LineageFidelity, RestoreFidelity, RestoredFile, SkipOracle, SkipReason,
+    by_timestamp_then_id, expand_home,
     extract::{Extracted, extract_compact_repr, extract_raw_record, extract_str, json_or_string},
     extracted_text,
     jsonl::{parse_bounded, peek_first_line, peek_last_mapped},
@@ -175,6 +176,18 @@ pub struct OpenClawFactory;
 impl AdapterFactory for OpenClawFactory {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    // File/archive-era sessions record no spawn edge and DB-era ones only resolve
+    // single-generation keys; compaction successors and checkpoint forks come through the
+    // header path. A spawn whose child key is Main-kind carries the root brand and classifies
+    // as a continuation.
+    fn lineage_fidelity(&self) -> LineageFidelity {
+        LineageFidelity {
+            spawns: EdgeFidelity::Partial,
+            continuations: EdgeFidelity::Complete,
+            spawn_brand_exact: true,
+        }
     }
 
     fn open(&self, config: Value) -> Result<Box<dyn Adapter>, AdapterError> {
@@ -4219,5 +4232,17 @@ mod tests {
             .and_then(Value::as_str);
         assert_eq!(got, temp.path().join(".openclaw").to_str());
         Ok(())
+    }
+
+    #[test]
+    fn declares_its_lineage_fidelity() {
+        assert_eq!(
+            OpenClawFactory.lineage_fidelity(),
+            LineageFidelity {
+                spawns: EdgeFidelity::Partial,
+                continuations: EdgeFidelity::Complete,
+                spawn_brand_exact: true,
+            }
+        );
     }
 }
