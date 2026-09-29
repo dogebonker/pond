@@ -610,6 +610,8 @@ mod ingest_handler {
                     match outcome.status {
                         OutcomeStatus::Inserted | OutcomeStatus::Matched => accepted += 1,
                         OutcomeStatus::Error => rejected += 1,
+                        // Withheld on purpose: neither landed nor failed.
+                        OutcomeStatus::Denylisted => {}
                     }
                 }
                 let results = outcomes
@@ -654,6 +656,7 @@ mod ingest_handler {
         let (status, error) = match (outcome.status, outcome.error) {
             (OutcomeStatus::Inserted, _) => (IngestStatus::Inserted, None),
             (OutcomeStatus::Matched, _) => (IngestStatus::Matched, None),
+            (OutcomeStatus::Denylisted, _) => (IngestStatus::Denylisted, None),
             (OutcomeStatus::Error, error) => {
                 let body = error
                     .map(|err| {
@@ -1414,10 +1417,23 @@ mod search_handler {
         // subagent match beyond the window can still sit in `matched_total` (the
         // un-hydrated pool tail) - the accepted cost of not re-adding the
         // `source_agent` materialization the S3 request-law removed.
-        if plan.exclude_subagents {
+        //
+        // Erased sessions drop out the same way. In steady state they have no
+        // rows, so this removes nothing; it covers an erase's anomaly windows
+        // and any index that still serves deleted rows before its rebuild
+        // (spec.md#session-append-only-exception). Not a caller filter, so
+        // prefilter pushdown is unaffected. `pond_sql` stays unfiltered.
+        let erased = store
+            .search_suppressed_sessions()
+            .await
+            .map_err(map_storage)?;
+        if plan.exclude_subagents || !erased.is_empty() {
             let excluded: std::collections::HashSet<String> = metas
                 .iter()
-                .filter(|meta| meta.source_agent.contains('/'))
+                .filter(|meta| {
+                    (plan.exclude_subagents && meta.source_agent.contains('/'))
+                        || erased.contains(&meta.session_id)
+                })
                 .map(|meta| meta.session_id.clone())
                 .collect();
             if !excluded.is_empty() {
@@ -1436,7 +1452,7 @@ mod search_handler {
                         .len(),
                 );
                 selected.retain(|candidate| !excluded.contains(&candidate.session_id));
-                metas.retain(|meta| !meta.source_agent.contains('/'));
+                metas.retain(|meta| !excluded.contains(&meta.session_id));
                 if selected.is_empty() {
                     return Ok(empty_response(searchable_in_scope));
                 }
@@ -2787,6 +2803,44 @@ mod get_tests {
             "the rejection teaches the session read: {}",
             error.error.message
         );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_erased_session_is_withheld_on_the_wire_and_absent_to_restore() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let intent = crate::erase::ErasedIntent {
+            at: Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap(),
+            root: "gone".to_owned(),
+        };
+        store
+            .import_erase_intent(&[intent.entry("gone")].into_iter().collect())
+            .await?;
+
+        let envelope = super::pond_ingest(
+            &store,
+            IngestRequest {
+                protocol_version: crate::PROTOCOL_VERSION,
+                namespace: Some("local".to_owned()),
+                events: vec![super::IngestEvent::Session(session("gone", "p"))],
+            },
+        )
+        .await;
+        let IngestEnvelope::Success(response) = envelope else {
+            panic!("a denylisted session is not a request failure: {envelope:?}");
+        };
+        assert_eq!((response.accepted, response.rejected), (0, 0));
+        assert_eq!(
+            response.results[0].status,
+            crate::wire::IngestStatus::Denylisted
+        );
+
+        assert!(matches!(
+            super::restore_lineage(&store, "gone").await?,
+            super::Lineage::NotFound
+        ));
         Ok(())
     }
 }

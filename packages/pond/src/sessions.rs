@@ -2,7 +2,7 @@
 //! `Store` facade, ingest validation, and `search_text` extraction.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::Path,
     sync::Arc,
 };
@@ -34,6 +34,7 @@ use tokio_stream::{Stream, StreamExt};
 
 use crate::{
     config, embed,
+    erase::{self, EraseEpoch},
     rowmap::{
         RowMetaBuilder, RowMetaEntry, RowMetaMap, RowMetaRef, RowMetaSet, UnorderedRows,
         discover_chain,
@@ -74,6 +75,13 @@ pub struct Store {
     /// model batch within one flush. Lets the CLI keep its progress line
     /// moving through the otherwise-opaque commit phase.
     ingest_embed_progress: Option<IngestEmbedProgress>,
+    /// Set once this process has purged the cached rowmap chains a
+    /// self-heal rollback of `messages` left untrusted (see
+    /// [`Store::heal_purge_pending`]).
+    heal_chains_purged: std::sync::atomic::AtomicBool,
+    /// How many of the handle's self-heals the erased-row check has covered
+    /// (see [`Store::report_erased_rows_after_heal`]).
+    heals_checked: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +109,28 @@ impl std::fmt::Debug for IngestEmbedProgress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("IngestEmbedProgress")
     }
+}
+
+/// A copy destination's key side of the closing verify (see
+/// [`Store::composite_pk_index`]).
+#[derive(Debug, Default)]
+pub struct DestKeyIndex {
+    pub keys: HashSet<Vec<String>>,
+    pub rows: usize,
+    /// Rows belonging to erased sessions, and those sessions.
+    pub erased_present: usize,
+    pub erased_sessions: BTreeSet<String>,
+}
+
+/// A copy source's key side of the closing verify (see
+/// [`Store::composite_pk_diff_against`]).
+#[derive(Debug, Default)]
+pub struct SourceKeyDiff {
+    /// Rows compared, erased sessions' rows excluded.
+    pub rows: usize,
+    pub absent: usize,
+    pub withheld_rows: usize,
+    pub withheld_sessions: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,19 +184,33 @@ impl TablePlan {
 }
 
 /// A store-to-store `pond copy` plan, decided per table (see [`TablePlan`]).
-/// `source_sessions` is the full source session count, kept so the caller can
-/// tell "destination already up to date" (empty plan, non-empty source) from
-/// "empty source", and so each table can recognize a from-empty/resumed run
-/// (`append.len() == source_sessions`) and skip the per-session `IN` filter.
+/// `source_sessions` is the full source session count - erased ones included -
+/// kept so the caller can tell "destination already up to date" (empty plan,
+/// non-empty source) from "empty source", and so each table can recognize a
+/// from-empty/resumed run (`append.len() == source_sessions`) and skip the
+/// per-session `IN` filter.
 #[derive(Debug, Clone, Default)]
 pub struct DeltaPlan {
     pub sessions: TablePlan,
     pub messages: TablePlan,
     pub parts: TablePlan,
     pub source_sessions: usize,
+    /// Source sessions left out because either end has erased them
+    /// (spec.md#session-append-only-exception).
+    pub withheld: usize,
+    /// Either end carries a denylist. The predicate-less wholesale scan is
+    /// then off: it would carry erased rows, including orphans a source that
+    /// crashed mid-erase still holds without their session row.
+    pub denylist_active: bool,
 }
 
 impl DeltaPlan {
+    /// The source session count that lets a table scan the source wholesale,
+    /// or `None` when a denylist forbids it.
+    fn wholesale_sessions(&self) -> Option<usize> {
+        (!self.denylist_active).then_some(self.source_sessions)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty() && self.messages.is_empty() && self.parts.is_empty()
     }
@@ -354,13 +398,17 @@ impl Store {
     /// [`Store::open_with_options`] instead so the same options flow into
     /// every dataset open and write.
     pub async fn open(location: &Url) -> Result<Self> {
-        Ok(Self {
+        let store = Self {
             handle: Handle::open(location).await?,
             rowmap: ArcSwapOption::empty(),
             sync_oracle_map: ArcSwapOption::empty(),
             embedder: None,
             ingest_embed_progress: None,
-        })
+            heal_chains_purged: std::sync::atomic::AtomicBool::new(false),
+            heals_checked: std::sync::atomic::AtomicUsize::new(0),
+        };
+        store.report_erased_rows_after_heal().await;
+        Ok(store)
     }
 
     /// Attach a resident embedder so [`Store::upsert_session_batch`] embeds
@@ -396,13 +444,17 @@ impl Store {
         storage_options: std::collections::HashMap<String, String>,
         caps: crate::substrate::RuntimeCaps,
     ) -> Result<Self> {
-        Ok(Self {
+        let store = Self {
             handle: Handle::open_with_options(location, storage_options, caps).await?,
             rowmap: ArcSwapOption::empty(),
             sync_oracle_map: ArcSwapOption::empty(),
             embedder: None,
             ingest_embed_progress: None,
-        })
+            heal_chains_purged: std::sync::atomic::AtomicBool::new(false),
+            heals_checked: std::sync::atomic::AtomicUsize::new(0),
+        };
+        store.report_erased_rows_after_heal().await;
+        Ok(store)
     }
 
     /// Like [`Self::open_with_options`], plus the on-disk `_indices/*` cache
@@ -413,7 +465,7 @@ impl Store {
         caps: crate::substrate::RuntimeCaps,
         index_cache_dir: Option<std::path::PathBuf>,
     ) -> Result<Self> {
-        Ok(Self {
+        let store = Self {
             handle: Handle::open_with_options_cached(
                 location,
                 storage_options,
@@ -425,7 +477,11 @@ impl Store {
             sync_oracle_map: ArcSwapOption::empty(),
             embedder: None,
             ingest_embed_progress: None,
-        })
+            heal_chains_purged: std::sync::atomic::AtomicBool::new(false),
+            heals_checked: std::sync::atomic::AtomicUsize::new(0),
+        };
+        store.report_erased_rows_after_heal().await;
+        Ok(store)
     }
 
     /// Convenience for tests and CLI verbs holding a `&Path`: wraps the path in
@@ -461,6 +517,25 @@ impl Store {
         let (parts, parts_version) = self
             .export_clean_table(Table::Parts, &dest.join("parts.lance"))
             .await?;
+        // The archive carries this store's erase intent, so restoring it can
+        // never resurrect what this store erased. Intent only: operation
+        // records and the epoch describe this store's own version chains.
+        let intent = self.erase_intent().await?;
+        if !intent.is_empty() {
+            for table in ["sessions.lance", "messages.lance"] {
+                let uri = dest.join(table);
+                let uri = uri
+                    .to_str()
+                    .with_context(|| format!("archive path is not UTF-8: {}", uri.display()))?;
+                let mut dataset = Dataset::open(uri)
+                    .await
+                    .with_context(|| format!("failed to reopen archive table {uri}"))?;
+                dataset
+                    .update_config(intent.clone())
+                    .await
+                    .with_context(|| format!("failed to record erase intent in {uri}"))?;
+            }
+        }
         Ok(LanceArchiveExport {
             rows: LanceArchiveCounts {
                 sessions,
@@ -486,14 +561,23 @@ impl Store {
         let sessions_upgrade = archive_schema_backfill(&sessions_dataset, Table::Sessions)?;
         let messages_upgrade = archive_schema_backfill(&messages_dataset, Table::Messages)?;
         let parts_upgrade = archive_schema_backfill(&parts_dataset, Table::Parts)?;
+        // Merge the archive's erase intent first (never weakening this store's),
+        // then withhold every session this store now has erased: an archive
+        // taken before an erase must not bring it back.
+        self.import_erase_intent(&erase::intent_entries([
+            sessions_dataset.config(),
+            messages_dataset.config(),
+        ]))
+        .await?;
+        let erased = self.erased_session_ids().await?;
         let (sessions, sessions_inserted) = self
-            .import_clean_table(Table::Sessions, sessions_dataset, sessions_upgrade)
+            .import_clean_table(Table::Sessions, sessions_dataset, sessions_upgrade, &erased)
             .await?;
         let (messages, messages_inserted) = self
-            .import_clean_table(Table::Messages, messages_dataset, messages_upgrade)
+            .import_clean_table(Table::Messages, messages_dataset, messages_upgrade, &erased)
             .await?;
         let (parts, parts_inserted) = self
-            .import_clean_table(Table::Parts, parts_dataset, parts_upgrade)
+            .import_clean_table(Table::Parts, parts_dataset, parts_upgrade, &erased)
             .await?;
         Ok(LanceArchiveImport {
             rows: LanceArchiveCounts {
@@ -565,12 +649,22 @@ impl Store {
         table: Table,
         dataset: Dataset,
         upgrade: Option<ColumnBackfill>,
+        erased: &HashSet<String>,
     ) -> Result<(usize, usize)> {
         // Force the destination table into existence up front: an empty
         // archive table yields zero batches, so merge_insert alone would
         // leave a lazily-created table (sessions or parts) missing on the destination.
         let _ = self.handle.dataset(table).await?;
-        self.merge_scanner(table, dataset.scan(), "archive import", upgrade)
+        let mut scanner = dataset.scan();
+        if !erased.is_empty() {
+            let column = match table {
+                Table::Sessions => "id",
+                Table::Messages | Table::Parts => "session_id",
+            };
+            let erased: Vec<String> = erased.iter().cloned().collect();
+            scanner.filter(&Predicate::Not(Box::new(in_predicate(column, &erased))).to_lance())?;
+        }
+        self.merge_scanner(table, scanner, "archive import", upgrade)
             .await
     }
 
@@ -683,6 +777,8 @@ impl Store {
             dest_msg_counts,
             source_part_counts,
             dest_part_counts,
+            source_erased,
+            dest_erased,
         ) = tokio::try_join!(
             source.collect_ids(Table::Sessions),
             self.collect_ids(Table::Sessions),
@@ -690,13 +786,20 @@ impl Store {
             self.all_session_message_counts(),
             source.all_session_part_counts(),
             self.all_session_part_counts(),
+            source.erased_session_ids(),
+            self.erased_session_ids(),
         )?;
         let source_sessions = source_ids.len();
         let mut plan = DeltaPlan {
             source_sessions,
+            denylist_active: !source_erased.is_empty() || !dest_erased.is_empty(),
             ..DeltaPlan::default()
         };
         for id in &source_ids {
+            if source_erased.contains(id) || dest_erased.contains(id) {
+                plan.withheld += 1;
+                continue;
+            }
             // The `sessions` table holds one immutable row per session, so it
             // only ever appends an absent id - a present row is identical.
             if !dest_ids.contains(id) {
@@ -749,21 +852,21 @@ impl Store {
                     Table::Sessions,
                     "id",
                     &plan.sessions,
-                    plan.source_sessions,
+                    plan.wholesale_sessions(),
                 ),
                 self.copy_table(
                     source,
                     Table::Messages,
                     "session_id",
                     &plan.messages,
-                    plan.source_sessions,
+                    plan.wholesale_sessions(),
                 ),
                 self.copy_table(
                     source,
                     Table::Parts,
                     "session_id",
                     &plan.parts,
-                    plan.source_sessions,
+                    plan.wholesale_sessions(),
                 ),
             )?;
         Ok(LanceArchiveImport {
@@ -790,7 +893,7 @@ impl Store {
         table: Table,
         key_column: &'static str,
         table_plan: &TablePlan,
-        source_sessions: usize,
+        wholesale_sessions: Option<usize>,
     ) -> Result<(usize, usize)> {
         // Force the destination table into existence up front so a lazily
         // created table (sessions or parts) is never left missing when its slice
@@ -803,7 +906,7 @@ impl Store {
                 table,
                 key_column,
                 &table_plan.append,
-                source_sessions,
+                wholesale_sessions,
             )
             .await?;
 
@@ -839,23 +942,23 @@ impl Store {
     }
 
     /// Append one table's slice for the listed sessions. A from-empty or resumed
-    /// copy (`session_ids.len() == source_sessions`: every session's rows for
+    /// copy (`session_ids.len() == wholesale_sessions`: every session's rows for
     /// this table are absent on the destination) scans the source wholesale
-    /// under one commit; a partial copy chunks the `IN` predicate (btree-pushed)
-    /// but still commits once per chunk, not per scan batch. Returns rows
-    /// appended.
+    /// under one commit; a partial copy - or any copy under a denylist - chunks
+    /// the `IN` predicate (btree-pushed) but still commits once per chunk, not
+    /// per scan batch. Returns rows appended.
     async fn append_sessions(
         &self,
         source: &Store,
         table: Table,
         key_column: &'static str,
         session_ids: &[String],
-        source_sessions: usize,
+        wholesale_sessions: Option<usize>,
     ) -> Result<usize> {
         if session_ids.is_empty() {
             return Ok(0);
         }
-        if session_ids.len() == source_sessions {
+        if Some(session_ids.len()) == wholesale_sessions {
             return self.append_scanner(source, table, None).await;
         }
         let mut rows = 0usize;
@@ -1129,6 +1232,10 @@ impl Store {
     ///      the freshness-bearing row; writing it last makes a partial
     ///      non-atomic flush re-ingest and heal (spec.md#session-movement-complete).
     ///   5. Composes per-session [`RowOutcome`]s in original substream order.
+    ///
+    /// Before any of that, every substream of an erased session is dropped
+    /// whole ([`OutcomeStatus::Denylisted`]): this is the write chokepoint the
+    /// denylist is authoritative at, whatever oracle the caller planned with.
     async fn upsert_session_batch(
         &self,
         substreams: Vec<CompletedSubstream>,
@@ -1139,6 +1246,23 @@ impl Store {
 
         let mut outcomes: Vec<RowOutcome> = Vec::with_capacity(substreams.len());
         let mut counts = BatchCounts::default();
+
+        let erased = self.erased_session_ids().await?;
+        let substreams = if erased.is_empty() {
+            substreams
+        } else {
+            let (denied, kept): (Vec<_>, Vec<_>) = substreams
+                .into_iter()
+                .partition(|substream| erased.contains(&substream.session.id));
+            for substream in &denied {
+                outcomes.extend(denylisted_outcomes(substream, &mut counts));
+            }
+            if kept.is_empty() {
+                outcomes.sort_by_key(|outcome| outcome.index);
+                return Ok((outcomes, counts));
+            }
+            kept
+        };
 
         // In-batch dedup. First occurrence of each session_id wins; later
         // occurrences either merge or get rejected. Iteration order preserves
@@ -1349,6 +1473,30 @@ impl Store {
             merge_insert_chunks(&self.handle, Table::Sessions, session_batches).await?;
         }
 
+        // An erase that committed its intent after this batch's probe cannot
+        // fence the append (config commits rebase over appends), so the writer
+        // checks what its own commits landed on - free, the manifests are in
+        // hand - and reports the race for the erase's re-sweep to clean up.
+        let (sessions_config, messages_config) = tokio::try_join!(
+            self.handle.committed_config(Table::Sessions),
+            self.handle.committed_config(Table::Messages),
+        )?;
+        let erased_now = erase::enforced_ids([&sessions_config, &messages_config]);
+        if !erased_now.is_empty() {
+            let raced: BTreeSet<&str> = writeable
+                .iter()
+                .map(|substream| substream.session.id.as_str())
+                .filter(|id| erased_now.contains(*id))
+                .collect();
+            if !raced.is_empty() {
+                tracing::warn!(
+                    sessions = ?raced,
+                    "wrote rows of sessions erased while this batch was in flight; the erase's re-sweep removes them, or rerun `pond erase` on them"
+                );
+                counts.wrote_erased += raced.len();
+            }
+        }
+
         for substream in &writeable {
             outcomes.extend(success_outcomes_for_substream(
                 substream.session_index,
@@ -1446,9 +1594,13 @@ impl Store {
                 ],
             )
             .await?;
+        let erased = self.erased_session_ids().await?;
         let mut sessions = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
-            sessions.push(session_from_batch(&batch, row)?);
+            let session = session_from_batch(&batch, row)?;
+            if !erased.contains(&session.id) {
+                sessions.push(session);
+            }
         }
         sessions.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(sessions)
@@ -1752,11 +1904,11 @@ impl Store {
     /// malformed record, hydrate miss, undecodable role or timestamp - also
     /// returns `None`, so the store scan stays the authority over a damaged
     /// map. The map carries no `content` (only system messages have one), so
-    /// rows come back with `content: None` - callers gate on that. The
-    /// version gate assumes append-only rows; a future `pond erase` must make
-    /// this row-set-aware, not just version-aware.
+    /// rows come back with `content: None` - callers gate on that. An erase
+    /// removes rows without necessarily moving the version past a map's, so
+    /// the map also passes the erase-epoch gate in [`Self::resident_rowmap`].
     async fn session_scan_rows_resident(&self, session_id: &str) -> Result<Option<Vec<ScanRow>>> {
-        let Some(map) = self.rowmap.load_full() else {
+        let Some(map) = self.resident_rowmap().await? else {
             return Ok(None);
         };
         if map.version() != self.messages_version().await? {
@@ -1834,13 +1986,24 @@ impl Store {
     }
 
     /// Locate the session id for a stored message. The resident meta map is
-    /// consulted first: pond is append-only and message ids are immutable, so
-    /// a map hit is definitive at any map version - no freshness gate. Only a
-    /// miss (a message newer than the map, or no map loaded) pays the store
-    /// scan, which on a remote store reads the whole unindexed `id` column
-    /// (measured ~93 s vs resident ~50 ms on the 2.6M-row corpus).
+    /// consulted first: message ids are immutable, so a hit from a map that
+    /// passed the erase-epoch gate ([`Self::resident_rowmap`]) is definitive at
+    /// any map version - an erase is the one way a mapped row stops existing,
+    /// and it moves the epoch. Only a miss (a message newer than the map, or no
+    /// map loaded) pays the store scan, which on a remote store reads the whole
+    /// unindexed `id` column (measured ~93 s vs resident ~50 ms on the
+    /// 2.6M-row corpus).
     pub async fn session_id_for_message(&self, message_id: &str) -> Result<Option<String>> {
-        if let Some(map) = self.rowmap.load_full()
+        let session_id = self.session_id_for_stored_message(message_id).await?;
+        // An erased session's messages resolve to nothing, like the session.
+        match session_id {
+            Some(id) if self.erased_session_ids().await?.contains(&id) => Ok(None),
+            other => Ok(other),
+        }
+    }
+
+    async fn session_id_for_stored_message(&self, message_id: &str) -> Result<Option<String>> {
+        if let Some(map) = self.resident_rowmap().await?
             && let Some(session_id) = map.lookup_session_for_message(message_id)
         {
             return Ok(Some(session_id.to_owned()));
@@ -1875,47 +2038,70 @@ impl Store {
     /// anomaly the copy verify reports rather than calling "synced"), and the
     /// key set drives the verify's completeness membership. One scan over only
     /// the PK columns yields both, holding a single composite-PK set per table.
-    pub async fn composite_pk_index(&self, table: Table) -> Result<(HashSet<Vec<String>>, usize)> {
+    ///
+    /// Rows whose session is in `erased` are counted apart
+    /// ([`DestKeyIndex::erased_present`]): an erased session's rows on a copy
+    /// destination are no duplicate and no gap, but they must not stay unseen.
+    pub async fn composite_pk_index(
+        &self,
+        table: Table,
+        erased: &HashSet<String>,
+    ) -> Result<DestKeyIndex> {
         let pk = pk_columns(table);
         let scanner = self.handle.scan(table, ScanOpts::project_only(pk)).await?;
         let mut stream = scanner.try_into_stream().await?;
-        let mut keys: HashSet<Vec<String>> = HashSet::new();
-        let mut rows = 0usize;
+        let mut index = DestKeyIndex::default();
         while let Some(batch) = stream.next().await {
             let batch = batch?;
             for row in 0..batch.num_rows() {
-                rows += 1;
-                keys.insert(composite_key(&batch, pk, row)?);
+                index.rows += 1;
+                let key = composite_key(&batch, pk, row)?;
+                // Every PK leads with the session id (`sessions.id` for sessions).
+                if erased.contains(&key[0]) {
+                    index.erased_present += 1;
+                    index.erased_sessions.insert(key[0].clone());
+                }
+                index.keys.insert(key);
             }
         }
-        Ok((keys, rows))
+        Ok(index)
     }
 
-    /// Stream `table`'s composite primary keys and return `(rows_scanned, rows
-    /// whose key is absent from `present`)`. Composite-keyed, not bare `id`: a
-    /// message id replayed into a new session by a fork/compaction is matched
-    /// per session, so a wholly-absent replayed session whose ids collide with
-    /// present ones is counted missing - a bare-`id` check would false-negative
-    /// it as "present". Streams the scanned side, holding only `present`.
+    /// Stream `table`'s composite primary keys and count the rows whose key is
+    /// absent from `present`. Composite-keyed, not bare `id`: a message id
+    /// replayed into a new session by a fork/compaction is matched per session,
+    /// so a wholly-absent replayed session whose ids collide with present ones
+    /// is counted missing - a bare-`id` check would false-negative it as
+    /// "present". Streams the scanned side, holding only `present`.
+    ///
+    /// Rows of `withhold` sessions are left out of both `rows` and `absent` and
+    /// tallied as withheld: an erased session is meant to be missing.
     pub async fn composite_pk_diff_against(
         &self,
         table: Table,
         present: &HashSet<Vec<String>>,
-    ) -> Result<(usize, usize)> {
+        withhold: &HashSet<String>,
+    ) -> Result<SourceKeyDiff> {
         let pk = pk_columns(table);
         let scanner = self.handle.scan(table, ScanOpts::project_only(pk)).await?;
         let mut stream = scanner.try_into_stream().await?;
-        let (mut rows, mut absent) = (0usize, 0usize);
+        let mut diff = SourceKeyDiff::default();
         while let Some(batch) = stream.next().await {
             let batch = batch?;
             for row in 0..batch.num_rows() {
-                rows += 1;
-                if !present.contains(&composite_key(&batch, pk, row)?) {
-                    absent += 1;
+                let key = composite_key(&batch, pk, row)?;
+                if withhold.contains(&key[0]) {
+                    diff.withheld_rows += 1;
+                    diff.withheld_sessions.insert(key[0].clone());
+                    continue;
+                }
+                diff.rows += 1;
+                if !present.contains(&key) {
+                    diff.absent += 1;
                 }
             }
         }
-        Ok((rows, absent))
+        Ok(diff)
     }
 
     /// A point-in-time `Arc<Dataset>` for `table`, for registering as a
@@ -1999,9 +2185,182 @@ impl Store {
         Ok(())
     }
 
+    /// The store's current erase epoch (spec.md#session-movement-complete),
+    /// read from the `messages` manifest config the handle already holds.
+    pub async fn erase_epoch(&self) -> Result<EraseEpoch> {
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        Ok(EraseEpoch::from_config(dataset.config()))
+    }
+
+    /// Session ids this store has erased: the union of the `pond.erased.*`
+    /// intent keys on `sessions` and `messages`
+    /// (spec.md#session-append-only-exception). Both configs ride on manifests
+    /// the handle already holds, so this costs no request of its own.
+    pub async fn erased_session_ids(&self) -> Result<HashSet<String>> {
+        self.report_erased_rows_after_heal().await;
+        Ok(erase::intent_ids(&self.erase_intent().await?))
+    }
+
+    /// The portable intent entries both tables carry - what copy and archive
+    /// export hand to another store.
+    pub async fn erase_intent(&self) -> Result<BTreeMap<String, String>> {
+        let (sessions, messages) = tokio::try_join!(
+            self.handle.config(Table::Sessions),
+            self.handle.config(Table::Messages),
+        )?;
+        Ok(erase::intent_entries([&sessions, &messages]))
+    }
+
+    /// Search reads only `messages`, whose intent replica is enough to
+    /// suppress erased sessions at zero cost.
+    pub async fn search_suppressed_sessions(&self) -> Result<HashSet<String>> {
+        let messages = self.handle.config(Table::Messages).await?;
+        Ok(erase::enforced_ids([&messages]))
+    }
+
+    /// Merge intent arriving by copy or restore into both tables under the
+    /// never-weaken rule ([`erase::intent_to_import`]). Returns how many
+    /// session ids became newly erased here.
+    pub async fn import_erase_intent(&self, incoming: &BTreeMap<String, String>) -> Result<usize> {
+        let entries = erase::intent_to_import(&self.erase_intent().await?, incoming);
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        // Sessions first, the table the ingest chokepoint consults.
+        self.handle
+            .insert_config_absent(Table::Sessions, &entries)
+            .await?;
+        self.handle
+            .insert_config_absent(Table::Messages, &entries)
+            .await?;
+        Ok(entries.len())
+    }
+
+    /// Carry `source`'s intent into this store - the intent half of a copy.
+    pub async fn copy_erase_intent_from(&self, source: &Store) -> Result<usize> {
+        self.import_erase_intent(&source.erase_intent().await?)
+            .await
+    }
+
+    /// After any self-heal, check whether the rollback brought back rows of
+    /// sessions this store has erased, and name the repair. Read-only (one
+    /// indexed scan per table, only when a heal happened), so safe under the
+    /// MCP read-only carve-out (spec.md#mcp-read-only-heal-exception).
+    async fn report_erased_rows_after_heal(&self) {
+        let heals = self.handle.healed_tables().len();
+        if heals
+            <= self
+                .heals_checked
+                .swap(heals, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let returned = self.erased_sessions_with_rows().await;
+        match returned {
+            Ok(returned) if !returned.is_empty() => {
+                let ids = returned.into_iter().collect::<Vec<_>>().join(" ");
+                tracing::warn!(
+                    "pond self-heal rolled back past an erase: erased sessions have rows again. Run `pond erase {ids}` to purge them"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "could not check erased sessions after a self-heal");
+            }
+        }
+    }
+
+    /// Erased session ids that still have rows in any table - empty in steady
+    /// state; non-empty after a rollback, a racing write or a pre-erase binary.
+    async fn erased_sessions_with_rows(&self) -> Result<BTreeSet<String>> {
+        let erased = erase::intent_ids(&self.erase_intent().await?);
+        if erased.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let values: Vec<ScalarValue> = erased.into_iter().map(ScalarValue::String).collect();
+        let mut returned = BTreeSet::new();
+        for (table, column) in [
+            (Table::Sessions, "id"),
+            (Table::Messages, "session_id"),
+            (Table::Parts, "session_id"),
+        ] {
+            let batch = self
+                .handle
+                .scan_batch(
+                    table,
+                    Some(&Predicate::In(column, values.clone())),
+                    &[column],
+                )
+                .await?;
+            for row in 0..batch.num_rows() {
+                returned.extend(string(&batch, column, row)?);
+            }
+        }
+        Ok(returned)
+    }
+
+    /// Whether local self-heal rolled `messages` back when this store opened.
+    /// A rollback can restore an epoch that a pre-erase chain or cursor matches
+    /// again, so every derived signal from before it is untrusted.
+    pub fn messages_healed(&self) -> bool {
+        self.handle.healed_tables().contains(&Table::Messages)
+    }
+
+    /// True until this process has purged the chains a `messages` heal left
+    /// behind; until then no cached chain is installed or trusted.
+    fn heal_purge_pending(&self) -> bool {
+        self.messages_healed()
+            && !self
+                .heal_chains_purged
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The resident chokepoint: the resident map, dropped first if the store's
+    /// erase epoch no longer admits it, so every reader falls back to store
+    /// reads until a valid map is installed.
+    async fn resident_rowmap(&self) -> Result<Option<Arc<RowMetaSet>>> {
+        if self.rowmap.load().is_none() {
+            return Ok(None);
+        }
+        Ok(self.resident_rowmap_under(self.erase_epoch().await?))
+    }
+
+    fn resident_rowmap_under(&self, epoch: EraseEpoch) -> Option<Arc<RowMetaSet>> {
+        let map = self.rowmap.load_full()?;
+        if epoch.admits(map.epoch()) {
+            return Some(map);
+        }
+        // Swap only the map this check saw, so a valid one a concurrent
+        // install just stored survives.
+        let stale = Some(map);
+        self.rowmap.compare_and_swap(&stale, None);
+        None
+    }
+
+    /// Whether a cached chain may be installed or extended under `epoch`.
+    fn chain_admitted(&self, set: &RowMetaSet, epoch: EraseEpoch) -> bool {
+        !self.heal_purge_pending() && epoch.admits(set.epoch())
+    }
+
+    /// Purge this store's chains and build temps if no sibling holds the
+    /// build lock; a held lock means a builder is already replacing them.
+    fn purge_rowmaps_if_unlocked(cache_dir: &Path, store_key: &str) {
+        let lock_path = cache_dir.join(format!("rowmetamap-{store_key}.lock"));
+        let Ok(lock) = std::fs::File::create(&lock_path) else {
+            return;
+        };
+        if lock.try_lock().is_ok() {
+            Self::purge_rowmaps(cache_dir, store_key);
+            Self::sweep_orphan_temps(cache_dir, store_key);
+        }
+    }
+
     async fn ensure_rowmap_inner(&self, cache_dir: &Path) -> Result<RowmapEnsure> {
-        let version = self.messages_version().await?;
-        if let Some(current) = self.rowmap.load_full()
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        let version = dataset.version().version;
+        let epoch = EraseEpoch::from_config(dataset.config());
+        drop(dataset);
+        if let Some(current) = self.resident_rowmap_under(epoch)
             && current.version() == version
         {
             return Ok(RowmapEnsure::Current);
@@ -2009,12 +2368,19 @@ impl Store {
         std::fs::create_dir_all(cache_dir)
             .with_context(|| format!("create cache dir {}", cache_dir.display()))?;
         let store_key = self.store_key();
+        // No signal built during an erase is ever valid: serve from the store
+        // (and sync from an empty oracle) until the erase republishes the epoch.
+        if epoch == EraseEpoch::InFlight {
+            Self::purge_rowmaps_if_unlocked(cache_dir, &store_key);
+            return Ok(RowmapEnsure::Contended);
+        }
 
         // A sibling may already have published a chain at this version; install
         // it without rebuilding.
         if let Some(chain) = discover_chain(cache_dir, &store_key)
             && chain.version() == version
             && let Ok(set) = RowMetaSet::open(&chain)
+            && self.chain_admitted(&set, epoch)
         {
             if self.rowmap_matches_store(&set, Coverage::Complete).await? {
                 self.rowmap.store(Some(Arc::new(set)));
@@ -2032,7 +2398,7 @@ impl Store {
             );
         }
         if let Some(set) = self
-            .extend_rowmap_coordinated(cache_dir, &store_key, version)
+            .extend_rowmap_coordinated(cache_dir, &store_key, version, epoch)
             .await?
         {
             self.rowmap.store(Some(Arc::new(set)));
@@ -2067,7 +2433,8 @@ impl Store {
     /// process's resident map once one exists, else the trailing map that call
     /// settled for. `None` when it found nothing to trust - the signal to leave
     /// the sync cursor alone rather than seed it from a chain the planner
-    /// itself rejected.
+    /// itself rejected. The sync cursor inherits its erase epoch from this map,
+    /// never from the store, so a pre-erase map cannot be blessed at persist.
     pub fn sync_oracle_snapshot(&self) -> Option<Arc<RowMetaSet>> {
         self.rowmap_snapshot()
             .or_else(|| self.sync_oracle_map.load_full())
@@ -2078,10 +2445,11 @@ impl Store {
     /// [`Self::sync_rowmap_oracle`] falls back to after losing the build lock.
     async fn trailing_rowmap_oracle(&self, cache_dir: &Path) -> Result<RowmapOracle> {
         // A resident map was validated against this store when this process
-        // installed it, so it is the cheaper baseline and needs no re-probe.
+        // installed it, so it is the cheaper baseline and needs no re-probe -
+        // only the erase-epoch gate, which an erase since then would fail.
         // `serve --with-sync` is always in this case: its prewarm refresh is
         // the sibling holding the lock.
-        if let Some(resident) = self.rowmap_snapshot() {
+        if let Some(resident) = self.resident_rowmap().await? {
             return Ok(RowmapOracle(Some(resident)));
         }
         let Some(set) = self.open_cached_rowmap(cache_dir).await else {
@@ -2105,10 +2473,12 @@ impl Store {
     /// `self.rowmap`: searches must not hydrate from a possibly-stale map.
     ///
     /// Deliberately version-agnostic - a trailing chain is the right baseline
-    /// here - so the only thing checked is that the chain is not a *previous
-    /// store's*. Without that, a store rebuilt at this path leaves `pond status`
-    /// reporting every source fresh and nothing pending: the same lie `pond
-    /// sync` used to tell, on a surface nobody thinks to distrust.
+    /// here - so the only things checked are that the chain is not a *previous
+    /// store's* and that no erase has happened since it was built. Without the
+    /// first, a store rebuilt at this path leaves `pond status` reporting every
+    /// source fresh and nothing pending: the same lie `pond sync` used to tell,
+    /// on a surface nobody thinks to distrust. Without the second, an erased
+    /// session's watermark would keep gating its re-allowed source fresh.
     ///
     /// This does only the row-count half of [`Self::rowmap_matches_store`], so
     /// `pond status` keeps its documented no-scan cost: a count is a manifest
@@ -2121,6 +2491,10 @@ impl Store {
         let chain = discover_chain(cache_dir, &self.store_key())?;
         let set = RowMetaSet::open(&chain).ok()?;
         let live = self.handle.dataset(Table::Messages).await.ok()?;
+        if !self.chain_admitted(&set, EraseEpoch::from_config(live.config())) {
+            Self::purge_rowmaps_if_unlocked(cache_dir, &self.store_key());
+            return None;
+        }
         if set.len() > live.count_rows(None).await.ok()? {
             tracing::debug!(
                 store = self.store_key(),
@@ -2137,8 +2511,11 @@ impl Store {
     /// hydration resident; with no chain, search falls back to take_rows for
     /// that single invocation.
     pub async fn load_rowmap_if_present(&self, cache_dir: &Path) -> Result<()> {
-        let version = self.messages_version().await?;
-        if let Some(current) = self.rowmap.load_full()
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        let version = dataset.version().version;
+        let epoch = EraseEpoch::from_config(dataset.config());
+        drop(dataset);
+        if let Some(current) = self.resident_rowmap_under(epoch)
             && current.version() == version
         {
             return Ok(());
@@ -2146,6 +2523,7 @@ impl Store {
         if let Some(chain) = discover_chain(cache_dir, &self.store_key())
             && chain.version() == version
             && let Ok(set) = RowMetaSet::open(&chain)
+            && self.chain_admitted(&set, epoch)
         {
             // Guarded like the sync paths, and for a sharper reason: this map
             // is what search hydration reads message ids out of, so a chain
@@ -2168,12 +2546,14 @@ impl Store {
     /// build only; atomic rename already prevents corruption). `None` when
     /// another local process holds the lock - this caller keeps its current map
     /// (or the take_rows fallback) until a later refresh opens what the winner
-    /// published.
+    /// published. `epoch` is the store's current erase epoch: a chain recorded
+    /// under any other one is purged and rebuilt, never extended.
     async fn extend_rowmap_coordinated(
         &self,
         cache_dir: &Path,
         store_key: &str,
         version: u64,
+        epoch: EraseEpoch,
     ) -> Result<Option<RowMetaSet>> {
         let lock_path = cache_dir.join(format!("rowmetamap-{store_key}.lock"));
         let lock = std::fs::File::create(&lock_path)
@@ -2186,12 +2566,23 @@ impl Store {
             }
         }
 
+        if self.heal_purge_pending() {
+            tracing::warn!(
+                store = store_key,
+                "messages was rolled back by self-heal; discarding cached rowmaps"
+            );
+            Self::purge_rowmaps(cache_dir, store_key);
+            self.heal_chains_purged
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
         // Re-check after acquiring: a sibling may have published `version`. An
         // open failure here (older MAGIC after an upgrade, or corruption) falls
         // through to the purge+rebuild below rather than erroring.
         if let Some(chain) = discover_chain(cache_dir, store_key)
             && chain.version() == version
             && let Ok(set) = RowMetaSet::open(&chain)
+            && epoch.admits(set.epoch())
             && self.rowmap_matches_store(&set, Coverage::Complete).await?
         {
             return Ok(Some(set));
@@ -2209,6 +2600,17 @@ impl Store {
         let chain = discover_chain(cache_dir, store_key);
         let existing = match &chain {
             Some(paths) => match RowMetaSet::open(paths) {
+                // A chain from before an erase may still map the erased rows,
+                // and a row count that regrew past the erase would let a delta
+                // extend it unnoticed (spec.md#session-movement-complete).
+                Ok(set) if !epoch.admits(set.epoch()) => {
+                    tracing::info!(
+                        store = store_key,
+                        "store erase epoch changed since the cached rowmap was built; rebuilding"
+                    );
+                    Self::purge_rowmaps(cache_dir, store_key);
+                    None
+                }
                 // A chain from a previous store at this path is worse than no
                 // chain: extending it would layer this store's new rows onto
                 // another store's rows and call the result current.
@@ -2229,25 +2631,23 @@ impl Store {
             },
             None => None,
         };
-        // A row-id-keyed append delta (None on a reclaimed base or net deletion)
+        // A row-id-keyed append delta (None on a reclaimed base, net deletion,
+        // or an erase landing between the check above and the delta's scan)
         // decides the path.
         let delta = match &existing {
-            Some((_, set)) => {
-                self.collect_row_metas_delta(
-                    set.version(),
-                    set.max_row_id().unwrap_or(0),
-                    set.len(),
-                )
+            Some((_, set)) => self
+                .collect_row_metas_delta(set.version(), set.max_row_id().unwrap_or(0), set.len())
                 .await?
-            }
+                .filter(|(_, delta_epoch)| *delta_epoch == set.epoch())
+                .map(|(entries, _)| entries),
             None => None,
         };
 
         let base_version = match (&existing, delta) {
             // Append with room: layer a new delta segment.
-            (Some((paths, _)), Some(entries)) if paths.deltas.len() < Self::MAX_ROWMAP_DELTAS => {
+            (Some((paths, set)), Some(entries)) if paths.deltas.len() < Self::MAX_ROWMAP_DELTAS => {
                 let path = RowMetaMap::delta_path(cache_dir, store_key, version);
-                RowMetaMap::build(&path, version, entries)?;
+                RowMetaMap::build(&path, version, set.epoch(), entries)?;
                 paths.base_version
             }
             // Append but the deltas are full: compact the existing segments
@@ -2263,12 +2663,16 @@ impl Store {
             // No chain, or a reclaimed base / deletion since it: full scan -> base.
             _ => {
                 let path = RowMetaMap::path_for(cache_dir, store_key, version);
+                // One snapshot for the scan and the epoch it records, so the
+                // chain can never claim an epoch its rows were not read under.
+                let dataset = self.handle.dataset(Table::Messages).await?;
+                let scanned_epoch = EraseEpoch::from_config(dataset.config());
                 // Streamed straight into the segment; only a store with no
                 // fragment order that yields ascending row ids falls back to
                 // collecting the corpus first.
-                if !self.build_rowmap_from_scan(&path, version).await? {
-                    let entries = self.collect_row_metas().await?;
-                    RowMetaMap::build(&path, version, entries)?;
+                if !Self::build_rowmap_from_scan(&dataset, &path, version, scanned_epoch).await? {
+                    let entries = Self::collect_row_metas_from(&dataset).await?;
+                    RowMetaMap::build(&path, version, scanned_epoch, entries)?;
                 }
                 version
             }
@@ -2632,7 +3036,7 @@ impl Store {
         limit: usize,
         filter: &Predicate,
     ) -> Result<Vec<SearchHit>> {
-        let mut hits = if let Some(map) = self.rowmap.load_full() {
+        let mut hits = if let Some(map) = self.resident_rowmap().await? {
             let rowid_hits = self.fts_search_rowids(query, limit, filter).await?;
             self.resolve_rowid_hits(&map, rowid_hits).await?
         } else {
@@ -2751,20 +3155,26 @@ impl Store {
     /// `RowMetaMap::build`. That decision is made from fragment metadata before
     /// a single data page is read, so the fallback does not pay for a scan it
     /// throws away.
-    async fn build_rowmap_from_scan(&self, path: &Path, version: u64) -> Result<bool> {
-        // One dataset handle for the plan, the row count and the scan: a
-        // re-`latest()` between them could plan against a manifest the scan no
-        // longer reads.
-        let dataset = self.handle.dataset(Table::Messages).await?;
-        let Some(fragments) = Self::ascending_row_id_fragments(&dataset).await? else {
+    ///
+    /// `dataset` is one snapshot for the plan, the row count, the scan and the
+    /// `epoch` the segment records: a re-`latest()` between them could plan
+    /// against a manifest the scan no longer reads.
+    async fn build_rowmap_from_scan(
+        dataset: &Dataset,
+        path: &Path,
+        version: u64,
+        epoch: EraseEpoch,
+    ) -> Result<bool> {
+        let Some(fragments) = Self::ascending_row_id_fragments(dataset).await? else {
             crate::rowmap::note_rowmap_scan_fallback();
             tracing::warn!(
-                store = %self.handle.location(),
+                store = %dataset.uri(),
                 "no fragment order yields ascending row ids; rebuilding the row meta map from a sorted collect"
             );
             return Ok(false);
         };
-        let mut builder = RowMetaBuilder::new(path, version, dataset.count_rows(None).await?)?;
+        let mut builder =
+            RowMetaBuilder::new(path, version, epoch, dataset.count_rows(None).await?)?;
         // `with_fragments(vec![])` is not "scan nothing" - an empty store has no
         // rows to fold in at all.
         if !fragments.is_empty() {
@@ -2897,8 +3307,12 @@ impl Store {
     /// dominates the bytes, so this holds the whole corpus and the streaming
     /// path above is what a cold build normally takes.
     pub async fn collect_row_metas(&self) -> Result<Vec<RowMetaEntry>> {
-        let row_count = self.handle.count_rows(Table::Messages).await?;
-        let mut scanner = self.handle.scanner(Table::Messages, None).await?;
+        Self::collect_row_metas_from(&self.handle.dataset(Table::Messages).await?).await
+    }
+
+    async fn collect_row_metas_from(dataset: &Dataset) -> Result<Vec<RowMetaEntry>> {
+        let row_count = dataset.count_rows(None).await?;
+        let mut scanner = dataset.scan();
         scanner.with_row_id();
         scanner.project(&Self::ROW_META_COLUMNS)?;
         let mut stream = scanner.try_into_stream().await?;
@@ -2933,13 +3347,12 @@ impl Store {
     ///
     /// - **Coverage** (`Coverage::Complete` callers only): at a version the
     ///   chain claims to describe in full, a valid map holds exactly as many
-    ///   rows as the store does. pond appends and merge-updates but never
-    ///   deletes, and stable row ids survive compaction, so the count is an
-    ///   equality, not a bound. One metadata read, no data pages. **When a
-    ///   delete path lands (`pond erase`), this stops being an equality**: a
-    ///   valid map would then hold rows the store no longer has, and the check
-    ///   has to become a bound plus a rebuild-on-shrink, or it will spuriously
-    ///   discard good chains and pay a full rebuild for each.
+    ///   rows as the store does. pond appends and merge-updates, stable row
+    ///   ids survive compaction, and its one deletion (`pond erase`) moves the
+    ///   erase epoch, which discards every chain built before it
+    ///   ([`EraseEpoch::admits`]) - so for any chain that reaches this check
+    ///   the count is still an equality, not a bound. One metadata read, no
+    ///   data pages.
     /// - **Identity**: the store's oldest rows must resolve, through the map, to
     ///   the messages they actually are. A row id naming a different message is
     ///   proof of a foreign chain.
@@ -3003,13 +3416,17 @@ impl Store {
     /// valid under that churn. Only genuine appends carry `row_id >
     /// base_max_row_id`; emitting just those keeps the delta disjoint from the
     /// base, which the per-segment count sums depend on.
+    ///
+    /// Also returns the erase epoch of the snapshot scanned: a delta read under
+    /// another epoch than its base's must not be layered on it.
     async fn collect_row_metas_delta(
         &self,
         base_version: u64,
         base_max_row_id: u64,
         base_row_count: usize,
-    ) -> Result<Option<Vec<RowMetaEntry>>> {
+    ) -> Result<Option<(Vec<RowMetaEntry>, EraseEpoch)>> {
         let dataset = self.handle.dataset(Table::Messages).await?;
+        let epoch = EraseEpoch::from_config(dataset.config());
         let Ok(old) = dataset.checkout_version(base_version).await else {
             return Ok(None);
         };
@@ -3028,7 +3445,7 @@ impl Store {
             .map(|fragment| fragment.metadata().clone())
             .collect();
         if added.is_empty() {
-            return Ok(Some(Vec::new()));
+            return Ok(Some((Vec::new(), epoch)));
         }
         let mut scanner = dataset.scan();
         scanner.with_fragments(added);
@@ -3046,7 +3463,7 @@ impl Store {
                 }
             }
         }
-        Ok(Some(out))
+        Ok(Some((out, epoch)))
     }
 
     /// Index-only FTS retriever: `_rowid` + `_score` only, so Lance inserts no
@@ -3200,7 +3617,7 @@ impl Store {
         filter: &Predicate,
         search: Option<&config::SearchConfig>,
     ) -> Result<Vec<SearchHit>> {
-        let mut hits = if let Some(map) = self.rowmap.load_full() {
+        let mut hits = if let Some(map) = self.resident_rowmap().await? {
             let rowid_hits = self
                 .vector_search_rowids(query, limit, filter, search)
                 .await?;
@@ -3342,7 +3759,7 @@ impl Store {
             return Ok(Vec::new());
         }
         let mut metas = Vec::with_capacity(rowids.len());
-        let misses: Vec<u64> = if let Some(map) = self.rowmap.load_full() {
+        let misses: Vec<u64> = if let Some(map) = self.resident_rowmap().await? {
             let (hits, misses) = map.hydrate(rowids);
             metas.extend(hits.into_iter().map(|entry| MessageMeta {
                 message_id: entry.message_id,
@@ -3460,7 +3877,7 @@ impl Store {
         // unlike meta hydration, a count cannot detect staleness by a row-id
         // miss, so a map that predates appended rows would undercount. A stale
         // or absent map falls through to the IN-scan.
-        if let Some(map) = self.rowmap.load_full()
+        if let Some(map) = self.resident_rowmap().await?
             && map.version() == self.messages_version().await?
         {
             return Ok(session_ids
@@ -3912,7 +4329,14 @@ impl Store {
 
     /// Single Sessions-table lookup - no message hydration. The cheap sibling
     /// of [`Store::get_session`] for callers that only need session metadata.
+    ///
+    /// An erased session is absent here even while rows of it linger in an
+    /// anomaly window (a racing write, a self-heal rollback): every get,
+    /// resume and restore goes through this lookup, so none of them serves it.
     pub(crate) async fn find_session(&self, session_id: &str) -> Result<Option<Session>> {
+        if self.erased_session_ids().await?.contains(session_id) {
+            return Ok(None);
+        }
         let batch = self
             .handle
             .scan_batch(
@@ -4171,6 +4595,13 @@ pub struct IngestSummary {
     /// labels - recurs on every sync of a corpus that produces them, so a
     /// steady non-zero count is that case, not an unfinished migration.
     pub relabeled_sessions: usize,
+    /// Rows withheld because their session is erased from this store
+    /// (spec.md#session-append-only-exception). Not a drop: nothing failed.
+    pub denylisted: usize,
+    /// Sessions a flush wrote rows for although an erase denylisted them while
+    /// the flush was in flight. Non-zero only under that race; the erase's
+    /// re-sweep, or a rerun of `pond erase`, removes the rows.
+    pub wrote_erased: usize,
     /// Files the adapter couldn't decode at all (no Session header
     /// extractable: empty `.jsonl`, missing required field).
     pub skipped_files: usize,
@@ -4244,6 +4675,11 @@ pub struct BatchCounts {
     /// the stored row. The stored labels were kept and the rows written under
     /// them (spec.md 7.6); nothing was dropped.
     pub relabeled_sessions: usize,
+    /// Rows withheld because their session is erased from this store.
+    pub denylisted: usize,
+    /// Sessions this flush wrote rows for although an erase denylisted them
+    /// while the flush was in flight (see `upsert_session_batch`).
+    pub wrote_erased: usize,
 }
 
 impl IngestSummary {
@@ -4264,6 +4700,8 @@ impl IngestSummary {
         self.parts_inserted += counts.parts_inserted;
         self.parts_matched += counts.parts_matched;
         self.relabeled_sessions += counts.relabeled_sessions;
+        self.denylisted += counts.denylisted;
+        self.wrote_erased += counts.wrote_erased;
         self.inserted +=
             counts.sessions_inserted + counts.messages_inserted_total + counts.parts_inserted;
         self.matched +=
@@ -4291,6 +4729,8 @@ impl IngestSummary {
         }
         self.dropped_sessions += other.dropped_sessions;
         self.relabeled_sessions += other.relabeled_sessions;
+        self.denylisted += other.denylisted;
+        self.wrote_erased += other.wrote_erased;
         self.skipped_files += other.skipped_files;
         if self.first_skip_reason.is_none() {
             self.first_skip_reason = other.first_skip_reason.clone();
@@ -4359,6 +4799,7 @@ impl IngestSummary {
                         _ => {}
                     }
                 }
+                OutcomeStatus::Denylisted => self.denylisted += 1,
                 OutcomeStatus::Error => {
                     // Session-level rejection: exactly one session-kind Error
                     // outcome (an invalid Session row - e.g. an empty
@@ -4405,6 +4846,9 @@ pub struct RowOutcome {
 pub enum OutcomeStatus {
     Inserted,
     Matched,
+    /// Withheld, not failed: the session is erased from this store
+    /// (spec.md#session-append-only-exception).
+    Denylisted,
     Error,
 }
 
@@ -4857,6 +5301,51 @@ impl IngestValidator {
         buffered.parts = parts;
         self.messages.push(buffered);
     }
+}
+
+/// Every row of an erased session's substream, reported as withheld rather
+/// than failed, with the rows counted into `counts.denylisted`.
+fn denylisted_outcomes(
+    substream: &CompletedSubstream,
+    counts: &mut BatchCounts,
+) -> Vec<RowOutcome> {
+    let outcome = |index, kind, pk| RowOutcome {
+        index,
+        kind,
+        pk,
+        status: OutcomeStatus::Denylisted,
+        error: None,
+        searchable: false,
+    };
+    let session_id = &substream.session.id;
+    let mut outcomes = Vec::new();
+    if let Some(index) = substream.session_index {
+        outcomes.push(outcome(index, "session", Value::String(session_id.clone())));
+    }
+    for buffered in &substream.messages {
+        let message_id = buffered.message.id();
+        outcomes.push(outcome(
+            buffered.index,
+            "message",
+            Value::Array(vec![
+                Value::String(session_id.clone()),
+                Value::String(message_id.to_owned()),
+            ]),
+        ));
+        for part in &buffered.parts {
+            outcomes.push(outcome(
+                part.index,
+                "part",
+                Value::Array(vec![
+                    Value::String(session_id.clone()),
+                    Value::String(message_id.to_owned()),
+                    Value::String(part.part.id.clone()),
+                ]),
+            ));
+        }
+    }
+    counts.denylisted += outcomes.len();
+    outcomes
 }
 
 fn error_outcome(
@@ -5642,7 +6131,6 @@ fn export_schema(table: Table) -> Arc<Schema> {
 /// columns (the archive predates an additive schema change) -> the recipe to
 /// derive them per batch; anything else -> a hard error naming the version fix.
 fn archive_schema_backfill(dataset: &Dataset, table: Table) -> Result<Option<ColumnBackfill>> {
-    use std::collections::BTreeSet;
     let expected = export_schema(table);
     let actual = lance::deps::arrow_schema::Schema::from(dataset.schema());
     let actual_names: BTreeSet<&str> = actual.fields().iter().map(|f| f.name().as_str()).collect();
@@ -7064,8 +7552,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn composite_pk_index_counts_duplicates_by_composite_key() -> anyhow::Result<()> {
         async fn duplicates(store: &Store, table: Table) -> anyhow::Result<usize> {
-            let (keys, rows) = store.composite_pk_index(table).await?;
-            Ok(rows - keys.len())
+            let index = store.composite_pk_index(table, &HashSet::new()).await?;
+            Ok(index.rows - index.keys.len())
         }
         let store = Store::open(&Url::parse("shared-memory://pond-test-dupcount/")?).await?;
         ingest_events(&store, conversational_events("01HXYDUP00000SESS1", 1)).await?;
@@ -9632,12 +10120,22 @@ mod tests {
         Ok(keys)
     }
 
+    async fn scan_build(store: &Store, path: &Path) -> anyhow::Result<bool> {
+        let dataset = store.handle.dataset(Table::Messages).await?;
+        Store::build_rowmap_from_scan(&dataset, path, 1, EraseEpoch::Never).await
+    }
+
     /// Build the same store both ways and return `(streaming used, digests)`.
     async fn build_both_ways(store: &Store, dir: &Path) -> anyhow::Result<(bool, String, String)> {
         let streamed = dir.join("streamed.rmm");
-        let used = store.build_rowmap_from_scan(&streamed, 1).await?;
+        let used = scan_build(store, &streamed).await?;
         let collected = dir.join("collected.rmm");
-        RowMetaMap::build(&collected, 1, store.collect_row_metas().await?)?;
+        RowMetaMap::build(
+            &collected,
+            1,
+            EraseEpoch::Never,
+            store.collect_row_metas().await?,
+        )?;
         let streamed_digest = if used {
             rowmap_digest(&streamed)
         } else {
@@ -9790,7 +10288,7 @@ mod tests {
         let before = crate::rowmap::rowmap_scan_fallbacks();
         let streamed = out.join("streamed.rmm");
         assert!(
-            !store.build_rowmap_from_scan(&streamed, 1).await?,
+            !scan_build(&store, &streamed).await?,
             "interleaved live row ids have no ascending fragment order",
         );
         assert!(
@@ -9845,9 +10343,7 @@ mod tests {
         std::fs::create_dir_all(&out)?;
         let before = crate::rowmap::rowmap_scan_fallbacks();
         assert!(
-            !store
-                .build_rowmap_from_scan(&out.join("streamed.rmm"), 1)
-                .await?,
+            !scan_build(&store, &out.join("streamed.rmm")).await?,
             "one fragment holding descending row ids cannot be reordered",
         );
         assert!(crate::rowmap::rowmap_scan_fallbacks() > before);
@@ -10428,6 +10924,392 @@ mod tests {
         // Empty input is the documented zero-path.
         let empty = store.session_message_counts(&[]).await?;
         assert!(empty.is_empty());
+        Ok(())
+    }
+
+    const SETTLED_EPOCH: &str = "0192d4a8-6f1e-7c3a-9b2d-5e8f7a6b4c3d";
+    const OTHER_EPOCH: &str = "0192d4a8-6f1e-7c3a-9b2d-5e8f7a6b4c3e";
+
+    async fn set_erase_epoch(store: &Store, value: &str) -> anyhow::Result<()> {
+        store
+            .handle
+            .set_config(Table::Messages, &[(crate::erase::EPOCH_KEY, value)])
+            .await
+    }
+
+    /// The resident chokepoint: once the store's epoch moves, no reader answers
+    /// out of the map it held - not the "definitive at any version" message
+    /// lookup, not hydration - and the next install records the new epoch.
+    #[tokio::test]
+    async fn an_epoch_change_drops_the_resident_map_before_any_read() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, _keys) = store_with_messages(&temp, 8).await?;
+        let cache = temp.path().join("cache");
+        store.ensure_rowmap(&cache).await?;
+        assert_eq!(
+            store.rowmap_snapshot().map(|map| map.epoch()),
+            Some(EraseEpoch::Never)
+        );
+
+        set_erase_epoch(&store, SETTLED_EPOCH).await?;
+        assert_eq!(
+            store.session_id_for_message("msg-0").await?.as_deref(),
+            Some("session-0"),
+            "the store read answers once the map is gone",
+        );
+        assert!(
+            store.rowmap_snapshot().is_none(),
+            "a map from another epoch is dropped at the first read",
+        );
+
+        store.ensure_rowmap(&cache).await?;
+        let rebuilt = store
+            .rowmap_snapshot()
+            .context("rebuilt under the new epoch")?;
+        assert_eq!(
+            rebuilt.epoch(),
+            EraseEpoch::from_config(&HashMap::from([(
+                crate::erase::EPOCH_KEY.to_owned(),
+                SETTLED_EPOCH.to_owned()
+            )]))
+        );
+        assert_eq!(
+            rebuilt.delta_count(),
+            0,
+            "rebuilt from a full scan, not extended"
+        );
+        Ok(())
+    }
+
+    /// F1, the regrow trap: an erase followed by enough appends to regrow the
+    /// row count used to extend the old base, keeping the erased rows. Under a
+    /// new epoch the chain is rebuilt, so no erased row id is installed.
+    #[tokio::test]
+    async fn a_regrown_store_never_extends_a_pre_erase_chain() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, _keys) = store_with_messages(&temp, 16).await?;
+        let cache = temp.path().join("cache");
+        store.ensure_rowmap(&cache).await?;
+        let before = store.rowmap_snapshot().context("built")?;
+        let erased_rows = before.lookup_count("session-0").context("mapped")?;
+        let base_len = before.len();
+        drop(before);
+
+        store
+            .handle
+            .delete_rows(Table::Messages, "session_id = 'session-0'")
+            .await?;
+        set_erase_epoch(&store, SETTLED_EPOCH).await?;
+        ingest_events(
+            &store,
+            conversational_events("session-regrow", erased_rows + 2),
+        )
+        .await?;
+        assert!(store.handle.count_rows(Table::Messages).await? >= base_len);
+
+        store.ensure_rowmap(&cache).await?;
+        let after = store.rowmap_snapshot().context("rebuilt")?;
+        assert_eq!(after.lookup_count("session-0"), None);
+        assert_eq!(after.len(), store.handle.count_rows(Table::Messages).await?);
+        assert_eq!(after.delta_count(), 0);
+        Ok(())
+    }
+
+    /// Under an in-flight epoch no chain is valid anywhere: nothing installs,
+    /// cached chains are purged, and the sync oracle falls back to empty.
+    #[tokio::test]
+    async fn an_in_flight_epoch_invalidates_every_chain() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (store, _keys) = store_with_messages(&temp, 8).await?;
+        let cache = temp.path().join("cache");
+        store.ensure_rowmap(&cache).await?;
+        set_erase_epoch(&store, "op-1:inflight").await?;
+
+        let reader = Store::open_local(temp.path()).await?;
+        reader.load_rowmap_if_present(&cache).await?;
+        assert!(reader.rowmap_snapshot().is_none());
+        assert!(reader.open_cached_rowmap(&cache).await.is_none());
+
+        let oracle = store.sync_rowmap_oracle(&cache).await?;
+        assert!(oracle.is_empty(), "sync re-reads everything mid-erase");
+        assert!(store.rowmap_snapshot().is_none());
+        assert!(
+            discover_chain(&cache, &store.store_key()).is_none(),
+            "cached chains are purged, not kept for later",
+        );
+
+        // Once the erase settles, a fresh chain is built and trusted again.
+        set_erase_epoch(&store, OTHER_EPOCH).await?;
+        store.ensure_rowmap(&cache).await?;
+        assert!(store.rowmap_snapshot().is_some());
+        Ok(())
+    }
+
+    /// A chain another process published before an erase settled is never
+    /// installed by a load-only reader or offered as a trailing baseline.
+    #[tokio::test]
+    async fn a_published_chain_from_another_epoch_is_not_installed() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let (builder, _keys) = store_with_messages(&temp, 8).await?;
+        let cache = temp.path().join("cache");
+        builder.ensure_rowmap(&cache).await?;
+        set_erase_epoch(&builder, SETTLED_EPOCH).await?;
+
+        let reader = Store::open_local(temp.path()).await?;
+        reader.load_rowmap_if_present(&cache).await?;
+        assert!(reader.rowmap_snapshot().is_none());
+        let _lock = hold_rowmap_lock(&builder, &cache)?;
+        assert!(reader.sync_rowmap_oracle(&cache).await?.is_empty());
+        Ok(())
+    }
+
+    /// A self-heal rollback of `messages` can restore an epoch a pre-erase
+    /// chain matches again, so the healed process trusts no cached chain
+    /// until it has purged them under the build lock.
+    #[tokio::test]
+    async fn a_messages_heal_purges_cached_chains() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let cache = temp.path().join("cache");
+        {
+            let (store, _keys) = store_with_messages(&temp, 8).await?;
+            ingest_events(&store, conversational_events("session-late", 2)).await?;
+            store.ensure_rowmap(&cache).await?;
+        }
+        let versions = temp.path().join("messages.lance").join("_versions");
+        // V2 manifest names are `u64::MAX - version`, V1 names the version.
+        let manifest_version = |path: &Path| -> Option<u64> {
+            let stem = path.file_name()?.to_str()?.strip_suffix(".manifest")?;
+            let number = stem.parse::<u64>().ok()?;
+            Some(if stem.len() == 20 {
+                u64::MAX - number
+            } else {
+                number
+            })
+        };
+        let head = std::fs::read_dir(&versions)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter_map(|path| manifest_version(&path).map(|version| (version, path)))
+            .max_by_key(|(version, _)| *version)
+            .context("a head manifest")?
+            .1;
+        std::fs::write(&head, b"")?;
+
+        let healed = Store::open_local(temp.path()).await?;
+        assert!(healed.messages_healed());
+        healed.load_rowmap_if_present(&cache).await?;
+        assert!(healed.rowmap_snapshot().is_none(), "untrusted until purged");
+        assert!(healed.open_cached_rowmap(&cache).await.is_none());
+
+        healed.ensure_rowmap(&cache).await?;
+        assert!(!healed.heal_purge_pending());
+        let map = healed
+            .rowmap_snapshot()
+            .context("rebuilt after the purge")?;
+        assert_eq!(map.len(), healed.handle.count_rows(Table::Messages).await?);
+        Ok(())
+    }
+
+    fn intent(root: &str, session_id: &str) -> (String, String) {
+        crate::erase::ErasedIntent {
+            at: DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
+            root: root.to_owned(),
+        }
+        .entry(session_id)
+    }
+
+    /// Forge the denylist the erase verb will write: intent on `tables` only,
+    /// so tests can prove the two-table union.
+    async fn erase_on(store: &Store, tables: &[Table], session_id: &str) -> anyhow::Result<()> {
+        let (key, value) = intent(session_id, session_id);
+        for table in tables {
+            store
+                .handle
+                .set_config(*table, &[(key.as_str(), value.as_str())])
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_erased_session_is_withheld_at_ingest_as_denylisted() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        // Intent on `messages` alone still enforces: the union of both tables.
+        erase_on(&store, &[Table::Messages], "gone").await?;
+
+        let mut events = conversational_events("gone", 2);
+        events.extend(conversational_events("kept", 1));
+        let outcomes = ingest_events(&store, events).await?;
+        let denylisted = outcomes
+            .iter()
+            .filter(|outcome| outcome.status == OutcomeStatus::Denylisted)
+            .count();
+        assert_eq!(denylisted, 5, "session + 2 messages + 2 parts withheld");
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.status != OutcomeStatus::Error)
+        );
+        assert!(store.find_session("gone").await?.is_none());
+        assert_eq!(store.session_ids().await?, vec!["kept".to_owned()]);
+        assert_eq!(store.handle.count_rows(Table::Messages).await?, 1);
+
+        let mut summary = IngestSummary::default();
+        summary.add_outcomes(&outcomes);
+        assert_eq!(summary.denylisted, 5);
+        Ok(())
+    }
+
+    /// F12: a writer whose probe predates an erase's intent commit still
+    /// appends (a config commit cannot fence it), then sees the intent on the
+    /// manifests its own commits landed on and reports the race.
+    #[tokio::test]
+    async fn a_batch_racing_an_erase_reports_wrote_erased() -> anyhow::Result<()> {
+        let url = Url::parse("shared-memory://pond-test-erase-wrote-erased/")?;
+        let writer = Store::open(&url).await?;
+        ingest_events(&writer, conversational_events("seed", 1)).await?;
+        // Pin the writer's cached manifests (the remote staleness window).
+        assert!(writer.erased_session_ids().await?.is_empty());
+
+        let eraser = Store::open(&url).await?;
+        erase_on(&eraser, &[Table::Sessions, Table::Messages], "raced").await?;
+
+        let mut validator = IngestValidator::default();
+        for (index, event) in conversational_events("raced", 1).into_iter().enumerate() {
+            validator.push(&writer, index, event).await?;
+        }
+        let (_, counts) = validator.finish(&writer).await?;
+        assert_eq!(counts.wrote_erased, 1);
+        assert_eq!(counts.denylisted, 0, "the stale probe let the rows through");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn copy_plan_withholds_ids_erased_on_either_end() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let source = Store::open_local(temp.path().join("source")).await?;
+        let dest = Store::open_local(temp.path().join("dest")).await?;
+        for id in ["a", "b", "c"] {
+            ingest_events(&source, conversational_events(id, 1)).await?;
+        }
+        erase_on(&source, &[Table::Sessions, Table::Messages], "a").await?;
+        erase_on(&dest, &[Table::Sessions, Table::Messages], "b").await?;
+
+        let plan = dest.plan_incremental_from(&source).await?;
+        assert_eq!(plan.source_sessions, 3, "the source count stays unfiltered");
+        assert_eq!(plan.withheld, 2);
+        assert!(plan.denylist_active);
+        assert_eq!(plan.sessions.append, vec!["c".to_owned()]);
+        assert_eq!(plan.messages.append, vec!["c".to_owned()]);
+        assert_eq!(plan.wholesale_sessions(), None, "no predicate-less scan");
+
+        dest.copy_delta_from(&source, &plan).await?;
+        assert_eq!(dest.session_ids().await?, vec!["c".to_owned()]);
+        Ok(())
+    }
+
+    /// A source that crashed mid-erase can hold orphan rows of an erased
+    /// session with no session row. Only the wholesale scan would carry them,
+    /// and it is off whenever a denylist exists.
+    #[tokio::test]
+    async fn a_denylist_disables_the_wholesale_copy_scan() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let source = Store::open_local(temp.path().join("source")).await?;
+        let dest = Store::open_local(temp.path().join("dest")).await?;
+        ingest_events(&source, conversational_events("kept", 1)).await?;
+        ingest_events(&source, conversational_events("orphan", 1)).await?;
+        source
+            .handle
+            .delete_rows(Table::Sessions, "id = 'orphan'")
+            .await?;
+        erase_on(&source, &[Table::Sessions, Table::Messages], "orphan").await?;
+
+        let plan = dest.plan_incremental_from(&source).await?;
+        assert_eq!(plan.messages.append, vec!["kept".to_owned()]);
+        dest.copy_delta_from(&source, &plan).await?;
+        assert_eq!(dest.handle.count_rows(Table::Messages).await?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verify_keys_withhold_erased_rows_and_count_them_on_the_destination()
+    -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        ingest_events(&store, conversational_events("gone", 2)).await?;
+        ingest_events(&store, conversational_events("kept", 1)).await?;
+        let erased = HashSet::from(["gone".to_owned()]);
+
+        let dest = store.composite_pk_index(Table::Messages, &erased).await?;
+        assert_eq!(dest.rows, 3);
+        assert_eq!(dest.erased_present, 2);
+        assert_eq!(dest.erased_sessions, BTreeSet::from(["gone".to_owned()]));
+
+        let diff = store
+            .composite_pk_diff_against(Table::Messages, &HashSet::new(), &erased)
+            .await?;
+        assert_eq!((diff.rows, diff.absent, diff.withheld_rows), (1, 1, 2));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn imported_intent_never_weakens_the_destination() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let (key, local) = intent("local-root", "shared");
+        store
+            .handle
+            .set_config(Table::Sessions, &[(key.as_str(), local.as_str())])
+            .await?;
+
+        let incoming = BTreeMap::from([
+            intent("foreign-root", "shared"),
+            intent("foreign-root", "fresh"),
+            ("pond.erase.op.x".to_owned(), "{}".to_owned()),
+            (crate::erase::EPOCH_KEY.to_owned(), SETTLED_EPOCH.to_owned()),
+        ]);
+        assert_eq!(store.import_erase_intent(&incoming).await?, 1);
+        let held = store.erase_intent().await?;
+        assert_eq!(
+            held.get(&key),
+            Some(&local),
+            "a present key is kept unchanged"
+        );
+        assert_eq!(held.len(), 2);
+        let (sessions, messages) = (
+            store.handle.config(Table::Sessions).await?,
+            store.handle.config(Table::Messages).await?,
+        );
+        let (fresh_key, _) = intent("foreign-root", "fresh");
+        assert!(sessions.contains_key(&fresh_key) && messages.contains_key(&fresh_key));
+        assert!(!messages.contains_key("pond.erase.op.x"));
+        assert!(!messages.contains_key(crate::erase::EPOCH_KEY));
+        Ok(())
+    }
+
+    /// Read suppression: in an anomaly window rows of an erased session exist,
+    /// yet no lookup that feeds get, resume or restore serves it.
+    #[tokio::test]
+    async fn lookups_treat_an_erased_session_as_absent() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        let mut child = synthetic_session("child");
+        child.parent_session_id = Some("parent".to_owned());
+        ingest_events(&store, conversational_events("parent", 1)).await?;
+        let mut events = vec![IngestEvent::Session(child)];
+        events.extend(conversational_events("child", 1).into_iter().skip(1));
+        ingest_events(&store, events).await?;
+        erase_on(&store, &[Table::Sessions], "child").await?;
+
+        assert!(store.find_session("child").await?.is_none());
+        assert!(store.get_session("child").await?.is_none());
+        assert!(store.child_sessions("parent").await?.is_empty());
+        assert!(store.find_session("parent").await?.is_some());
+        assert_eq!(
+            store.erased_sessions_with_rows().await?,
+            BTreeSet::from(["child".to_owned()]),
+            "the rows are still there, only suppressed",
+        );
         Ok(())
     }
 }

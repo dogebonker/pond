@@ -1929,6 +1929,11 @@ pub struct Handle {
     /// applied on every dataset open, including the lazy sessions/parts opens
     /// and any re-open.
     store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    /// Tables this handle rolled back through local self-heal when it opened
+    /// them (spec.md#local-store-self-heal), in heal order. Sticky: callers
+    /// that must react to a rollback (derived-cache purge, the erased-row
+    /// check) read it whenever they next run.
+    healed: std::sync::Mutex<Vec<Table>>,
 }
 
 impl std::fmt::Debug for Handle {
@@ -2147,22 +2152,20 @@ impl Handle {
             Duration::from_secs(5)
         };
         let wrapper = store_wrapper(location, index_cache_dir.as_deref());
+        let (messages, messages_healed) = open_or_create_via_ns(
+            &nm,
+            &nm_ident,
+            sessions::MESSAGES,
+            sessions::message_schema(),
+            &session,
+            &storage_options,
+            wrapper.clone(),
+        )
+        .await?;
         let handle = Self {
             datasets: DatasetSet {
                 sessions: OnceCell::new(),
-                messages: Mutex::new(CachedDataset::new(
-                    open_or_create_via_ns(
-                        &nm,
-                        &nm_ident,
-                        sessions::MESSAGES,
-                        sessions::message_schema(),
-                        &session,
-                        &storage_options,
-                        wrapper.clone(),
-                    )
-                    .await?,
-                    refresh_after,
-                )),
+                messages: Mutex::new(CachedDataset::new(messages, refresh_after)),
                 parts: OnceCell::new(),
             },
             retry: RetryPolicy::default(),
@@ -2173,6 +2176,11 @@ impl Handle {
             location: location.clone(),
             lazy_refresh_after: refresh_after,
             store_wrapper: wrapper,
+            healed: std::sync::Mutex::new(if messages_healed {
+                vec![Table::Messages]
+            } else {
+                Vec::new()
+            }),
         };
         Ok(handle)
     }
@@ -2865,6 +2873,91 @@ impl Handle {
         let mut cached = self.cached(table).await?.lock().await;
         cached.latest().await
     }
+
+    /// `table`'s manifest config through the freshness gate. The map rides on
+    /// the manifest the handle already holds, so this costs no request beyond
+    /// the refresh any read would pay.
+    pub(crate) async fn config(&self, table: Table) -> Result<HashMap<String, String>> {
+        Ok(self.dataset(table).await?.config().clone())
+    }
+
+    /// The config of the manifest this handle last committed or refreshed to,
+    /// without a refresh - right after a write, the writer's own commit. Free:
+    /// a writer uses it to see what its commit landed on top of.
+    pub(crate) async fn committed_config(&self, table: Table) -> Result<HashMap<String, String>> {
+        let cached = self.cached(table).await?.lock().await;
+        Ok(cached.dataset.config().clone())
+    }
+
+    /// Insert the `entries` whose keys `table`'s config lacks, leaving every
+    /// present key untouched. Disjoint config keys never conflict with data
+    /// commits (Lance rebases `UpdateConfig` over them), so the retry only
+    /// re-reads under a same-key race. Returns how many keys were inserted.
+    pub(crate) async fn insert_config_absent(
+        &self,
+        table: Table,
+        entries: &[(String, String)],
+    ) -> Result<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        self.retry_lance(table.label(), || async {
+            let mut cached = self.cached(table).await?.lock().await;
+            let mut dataset = cached.latest().await?;
+            let absent: Vec<(String, String)> = entries
+                .iter()
+                .filter(|(key, _)| !dataset.config().contains_key(key))
+                .cloned()
+                .collect();
+            if absent.is_empty() {
+                return Ok(0);
+            }
+            dataset
+                .update_config(absent.clone())
+                .await
+                .with_context(|| format!("update_config failed for {}", table.label()))?;
+            cached.replace(dataset);
+            Ok(absent.len())
+        })
+        .await
+    }
+
+    /// Overwrite config keys verbatim - the forging path tests use to stand in
+    /// for the erase verb.
+    #[cfg(test)]
+    pub(crate) async fn set_config(&self, table: Table, entries: &[(&str, &str)]) -> Result<()> {
+        let mut cached = self.cached(table).await?.lock().await;
+        let mut dataset = cached.latest().await?;
+        dataset.update_config(entries.iter().copied()).await?;
+        cached.replace(dataset);
+        Ok(())
+    }
+
+    /// Delete the rows matching `predicate` - tests stand in for an erase's
+    /// delete step with it.
+    #[cfg(test)]
+    pub(crate) async fn delete_rows(&self, table: Table, predicate: &str) -> Result<()> {
+        let mut cached = self.cached(table).await?.lock().await;
+        let mut dataset = cached.latest().await?;
+        dataset.delete(predicate).await?;
+        cached.replace(dataset);
+        Ok(())
+    }
+
+    fn record_heal(&self, table: Table) {
+        if let Ok(mut healed) = self.healed.lock() {
+            healed.push(table);
+        }
+    }
+
+    /// Tables rolled back by self-heal since this handle opened.
+    pub(crate) fn healed_tables(&self) -> Vec<Table> {
+        self.healed
+            .lock()
+            .map(|healed| healed.clone())
+            .unwrap_or_default()
+    }
+
     /// Build a prefiltered `Scanner` for `table`. Composable read entry
     /// point for callers that need to layer extra builder calls
     /// (`full_text_search`, `nearest`) on top of pond's predicate seam.
@@ -3220,7 +3313,7 @@ impl Handle {
     async fn sessions_cached(&self) -> Result<&Mutex<CachedDataset>> {
         self.lazy_cached(
             &self.datasets.sessions,
-            sessions::SESSIONS,
+            Table::Sessions,
             sessions::session_schema,
         )
         .await
@@ -3229,7 +3322,7 @@ impl Handle {
     /// Open `parts.lance` on first use (spec.md#datasets). Single-flight via
     /// `OnceCell`; once initialized, behaves identically to the other two.
     async fn parts_cached(&self) -> Result<&Mutex<CachedDataset>> {
-        self.lazy_cached(&self.datasets.parts, sessions::PARTS, sessions::part_schema)
+        self.lazy_cached(&self.datasets.parts, Table::Parts, sessions::part_schema)
             .await
     }
 
@@ -3239,20 +3332,23 @@ impl Handle {
     async fn lazy_cached<'a>(
         &self,
         cell: &'a OnceCell<Mutex<CachedDataset>>,
-        table_name: &str,
+        table: Table,
         schema: fn() -> lance::deps::arrow_schema::SchemaRef,
     ) -> Result<&'a Mutex<CachedDataset>> {
         cell.get_or_try_init(|| async {
-            let dataset = open_or_create_via_ns(
+            let (dataset, healed) = open_or_create_via_ns(
                 &self.nm,
                 &self.nm_ident,
-                table_name,
+                table.as_str(),
                 schema(),
                 &self.session,
                 &self.storage_options,
                 self.store_wrapper.clone(),
             )
             .await?;
+            if healed {
+                self.record_heal(table);
+            }
             Ok::<_, anyhow::Error>(Mutex::new(CachedDataset::new(
                 dataset,
                 self.lazy_refresh_after,
@@ -4998,7 +5094,7 @@ async fn open_or_create_via_ns(
     session: &Arc<Session>,
     storage_options: &HashMap<String, String>,
     wrapper: Option<Arc<dyn WrappingObjectStore>>,
-) -> Result<Dataset> {
+) -> Result<(Dataset, bool)> {
     let table_id = nm_ident.as_table_id(table_name);
 
     let request = DescribeTableRequest {
@@ -5015,6 +5111,7 @@ async fn open_or_create_via_ns(
                 &wrapper,
                 storage_options,
             );
+            let mut healed = false;
             let mut dataset = match builder.load().await {
                 Ok(dataset) => dataset,
                 Err(load_error) => {
@@ -5026,7 +5123,7 @@ async fn open_or_create_via_ns(
                     // Remote stores never produce this (atomic PUT), so heal is local-only.
                     match config::local_path(&uri_to_url(&location)?) {
                         Some(table_root) => {
-                            heal_local_dataset(
+                            let dataset = heal_local_dataset(
                                 &location,
                                 &table_root,
                                 table_name,
@@ -5035,14 +5132,16 @@ async fn open_or_create_via_ns(
                                 &wrapper,
                                 load_error,
                             )
-                            .await?
+                            .await?;
+                            healed = true;
+                            dataset
                         }
                         None => return Err(load_error),
                     }
                 }
             };
             ensure_current_schema(&mut dataset, schema.as_ref(), table_name).await?;
-            return Ok(dataset);
+            return Ok((dataset, healed));
         }
         Err(error) => match &error {
             error if is_namespace_error_code(error, ErrorCode::TableNotFound) => {
@@ -5075,9 +5174,10 @@ async fn open_or_create_via_ns(
         });
     }
     let reader = sessions::empty_reader(schema)?;
-    Dataset::write_into_namespace(reader, nm.clone(), table_id, Some(write_params))
+    let dataset = Dataset::write_into_namespace(reader, nm.clone(), table_id, Some(write_params))
         .await
-        .with_context(|| format!("failed to create table {table_name}"))
+        .with_context(|| format!("failed to create table {table_name}"))?;
+    Ok((dataset, false))
 }
 
 /// Apply the same session/wrapper/storage-option store params to a
