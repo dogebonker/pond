@@ -4758,6 +4758,11 @@ async fn run_sync_stages(
 /// ingest chokepoint drops their rows regardless, so a failed read degrades to
 /// decoding them.
 async fn sync_skip_oracle(store: &Store, quiet: bool) -> Box<dyn pond::adapter::SkipOracle> {
+    // Here, not in `usable_sync_cursor`: a cycle served by the rowmap never
+    // reads the cursor, and `persist_sync_cursor` would keep the stale one.
+    if store.take_heal_cursor_discard() {
+        syncstate::remove_sync_cursor(&store.store_key());
+    }
     let rowmap = sync_rowmap_oracle_with_spinner(store, quiet).await;
     let inner: Box<dyn pond::adapter::SkipOracle> = if rowmap.0.is_some() {
         Box::new(rowmap)
@@ -4780,7 +4785,7 @@ async fn sync_skip_oracle(store: &Store, quiet: bool) -> Box<dyn pond::adapter::
 async fn usable_sync_cursor(store: &Store) -> Option<syncstate::SyncCursor> {
     let store_key = &store.store_key();
     let cursor = syncstate::read_sync_cursor(store_key)?;
-    if !cursor.admitted_by(store.erase_epoch().await.ok()?, store.messages_healed()) {
+    if !cursor.admitted_by(store.erase_epoch().await.ok()?, store.heal_purge_pending()) {
         tracing::info!(
             store = store_key,
             "sync cursor predates an erase or a self-heal of this store; discarding it"

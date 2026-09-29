@@ -79,6 +79,9 @@ pub struct Store {
     /// self-heal rollback of `messages` left untrusted (see
     /// [`Store::heal_purge_pending`]).
     heal_chains_purged: std::sync::atomic::AtomicBool,
+    /// Set once this process has discarded the sync cursor a `messages` heal
+    /// left untrusted (see [`Store::take_heal_cursor_discard`]).
+    heal_cursor_discarded: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -402,6 +405,7 @@ impl Store {
             embedder: None,
             ingest_embed_progress: None,
             heal_chains_purged: std::sync::atomic::AtomicBool::new(false),
+            heal_cursor_discarded: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -445,6 +449,7 @@ impl Store {
             embedder: None,
             ingest_embed_progress: None,
             heal_chains_purged: std::sync::atomic::AtomicBool::new(false),
+            heal_cursor_discarded: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -469,6 +474,7 @@ impl Store {
             embedder: None,
             ingest_embed_progress: None,
             heal_chains_purged: std::sync::atomic::AtomicBool::new(false),
+            heal_cursor_discarded: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2232,17 +2238,28 @@ impl Store {
     /// Whether local self-heal rolled `messages` back when this store opened.
     /// A rollback can restore an epoch that a pre-erase chain or cursor matches
     /// again, so every derived signal from before it is untrusted.
-    pub fn messages_healed(&self) -> bool {
+    fn messages_healed(&self) -> bool {
         self.handle.healed_tables().contains(&Table::Messages)
     }
 
     /// True until this process has purged the chains a `messages` heal left
-    /// behind; until then no cached chain is installed or trusted.
-    fn heal_purge_pending(&self) -> bool {
+    /// behind; until then no cached chain, and no sync cursor, is trusted.
+    pub fn heal_purge_pending(&self) -> bool {
         self.messages_healed()
             && !self
                 .heal_chains_purged
                 .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// True exactly once after a `messages` heal: the caller discards the
+    /// persisted sync cursor, which may predate the rollback. Later cycles
+    /// trust the cursor they write themselves, so a long-lived serve re-reads
+    /// every source once rather than on every cycle.
+    pub fn take_heal_cursor_discard(&self) -> bool {
+        self.messages_healed()
+            && !self
+                .heal_cursor_discarded
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The resident chokepoint: the resident map, dropped first if the store's
@@ -10993,17 +11010,13 @@ mod tests {
         Ok(())
     }
 
-    /// A self-heal rollback of `messages` can restore an epoch a pre-erase
-    /// chain matches again, so the healed process trusts no cached chain
-    /// until it has purged them under the build lock.
-    #[tokio::test]
-    async fn a_messages_heal_purges_cached_chains() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let cache = temp.path().join("cache");
+    /// A store whose open self-healed `messages`, with a rowmap chain cached
+    /// in `cache` from before the rollback.
+    async fn healed_store(temp: &TempDir, cache: &Path) -> anyhow::Result<Store> {
         {
-            let (store, _keys) = store_with_messages(&temp, 8).await?;
+            let (store, _keys) = store_with_messages(temp, 8).await?;
             ingest_events(&store, conversational_events("session-late", 2)).await?;
-            store.ensure_rowmap(&cache).await?;
+            store.ensure_rowmap(cache).await?;
         }
         let versions = temp.path().join("messages.lance").join("_versions");
         // V2 manifest names are `u64::MAX - version`, V1 names the version.
@@ -11026,6 +11039,17 @@ mod tests {
 
         let healed = Store::open_local(temp.path()).await?;
         assert!(healed.messages_healed());
+        Ok(healed)
+    }
+
+    /// A self-heal rollback of `messages` can restore an epoch a pre-erase
+    /// chain matches again, so the healed process trusts no cached chain
+    /// until it has purged them under the build lock.
+    #[tokio::test]
+    async fn a_messages_heal_purges_cached_chains() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let cache = temp.path().join("cache");
+        let healed = healed_store(&temp, &cache).await?;
         healed.load_rowmap_if_present(&cache).await?;
         assert!(healed.rowmap_snapshot().is_none(), "untrusted until purged");
         assert!(healed.open_cached_rowmap(&cache).await.is_none());
@@ -11036,6 +11060,33 @@ mod tests {
             .rowmap_snapshot()
             .context("rebuilt after the purge")?;
         assert_eq!(map.len(), healed.handle.count_rows(Table::Messages).await?);
+        Ok(())
+    }
+
+    /// The heal's reaction to the sync cursor runs once: the first cycle
+    /// discards it, and once the chains are purged a cursor written after the
+    /// heal is admitted again, so a long-lived serve does not fall back to a
+    /// full re-read on every cycle.
+    #[tokio::test]
+    async fn a_messages_heal_discards_the_sync_cursor_once() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let cache = temp.path().join("cache");
+        let healed = healed_store(&temp, &cache).await?;
+        assert!(
+            healed.heal_purge_pending(),
+            "no cursor trusted before the purge"
+        );
+        assert!(healed.take_heal_cursor_discard());
+
+        healed.ensure_rowmap(&cache).await?;
+        assert!(
+            !healed.take_heal_cursor_discard(),
+            "the next cycle keeps its cursor"
+        );
+        assert!(
+            !healed.heal_purge_pending(),
+            "the next cycle's cursor is admitted"
+        );
         Ok(())
     }
 

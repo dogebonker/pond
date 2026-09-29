@@ -236,13 +236,14 @@ impl SyncCursor {
 
     /// The erase half of the lineage check: the store's `current` epoch must
     /// admit this cursor's, and a self-heal rollback of `messages` (which can
-    /// restore an epoch a stale cursor matches again) voids it outright.
+    /// restore an epoch a stale cursor matches again) voids it until the
+    /// heal's chains are purged.
     pub(crate) fn admitted_by(
         &self,
         current: pond::erase::EraseEpoch,
-        messages_healed: bool,
+        heal_purge_pending: bool,
     ) -> bool {
-        !messages_healed && current.admits(self.erase_epoch)
+        !heal_purge_pending && current.admits(self.erase_epoch)
     }
 }
 
