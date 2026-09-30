@@ -4,7 +4,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Context, Result};
@@ -78,10 +81,10 @@ pub struct Store {
     /// Set once this process has purged the cached rowmap chains a
     /// self-heal rollback of `messages` left untrusted (see
     /// [`Store::heal_purge_pending`]).
-    heal_chains_purged: std::sync::atomic::AtomicBool,
+    heal_chains_purged: AtomicBool,
     /// Set once this process has discarded the sync cursor a `messages` heal
     /// left untrusted (see [`Store::take_heal_cursor_discard`]).
-    heal_cursor_discarded: std::sync::atomic::AtomicBool,
+    heal_cursor_discarded: AtomicBool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -402,15 +405,19 @@ impl Store {
     /// [`Store::open_with_options`] instead so the same options flow into
     /// every dataset open and write.
     pub async fn open(location: &Url) -> Result<Self> {
-        Ok(Self {
-            handle: Handle::open(location).await?,
+        Ok(Self::from_handle(Handle::open(location).await?))
+    }
+
+    fn from_handle(handle: Handle) -> Self {
+        Self {
+            handle,
             rowmap: ArcSwapOption::empty(),
             sync_oracle_map: ArcSwapOption::empty(),
             embedder: None,
             ingest_embed_progress: None,
-            heal_chains_purged: std::sync::atomic::AtomicBool::new(false),
-            heal_cursor_discarded: std::sync::atomic::AtomicBool::new(false),
-        })
+            heal_chains_purged: AtomicBool::new(false),
+            heal_cursor_discarded: AtomicBool::new(false),
+        }
     }
 
     /// Attach a resident embedder so [`Store::upsert_session_batch`] embeds
@@ -446,15 +453,9 @@ impl Store {
         storage_options: std::collections::HashMap<String, String>,
         caps: crate::substrate::RuntimeCaps,
     ) -> Result<Self> {
-        Ok(Self {
-            handle: Handle::open_with_options(location, storage_options, caps).await?,
-            rowmap: ArcSwapOption::empty(),
-            sync_oracle_map: ArcSwapOption::empty(),
-            embedder: None,
-            ingest_embed_progress: None,
-            heal_chains_purged: std::sync::atomic::AtomicBool::new(false),
-            heal_cursor_discarded: std::sync::atomic::AtomicBool::new(false),
-        })
+        Ok(Self::from_handle(
+            Handle::open_with_options(location, storage_options, caps).await?,
+        ))
     }
 
     /// Like [`Self::open_with_options`], plus the on-disk `_indices/*` cache
@@ -465,21 +466,10 @@ impl Store {
         caps: crate::substrate::RuntimeCaps,
         index_cache_dir: Option<std::path::PathBuf>,
     ) -> Result<Self> {
-        Ok(Self {
-            handle: Handle::open_with_options_cached(
-                location,
-                storage_options,
-                caps,
-                index_cache_dir,
-            )
-            .await?,
-            rowmap: ArcSwapOption::empty(),
-            sync_oracle_map: ArcSwapOption::empty(),
-            embedder: None,
-            ingest_embed_progress: None,
-            heal_chains_purged: std::sync::atomic::AtomicBool::new(false),
-            heal_cursor_discarded: std::sync::atomic::AtomicBool::new(false),
-        })
+        Ok(Self::from_handle(
+            Handle::open_with_options_cached(location, storage_options, caps, index_cache_dir)
+                .await?,
+        ))
     }
 
     /// Convenience for tests and CLI verbs holding a `&Path`: wraps the path in
@@ -2277,10 +2267,7 @@ impl Store {
     /// True until this process has purged the chains a `messages` heal left
     /// behind; until then no cached chain, and no sync cursor, is trusted.
     pub fn heal_purge_pending(&self) -> bool {
-        self.messages_healed()
-            && !self
-                .heal_chains_purged
-                .load(std::sync::atomic::Ordering::Relaxed)
+        self.messages_healed() && !self.heal_chains_purged.load(Ordering::Relaxed)
     }
 
     /// True exactly once after a `messages` heal: the caller discards the
@@ -2288,10 +2275,7 @@ impl Store {
     /// trust the cursor they write themselves, so a long-lived serve re-reads
     /// every source once rather than on every cycle.
     pub fn take_heal_cursor_discard(&self) -> bool {
-        self.messages_healed()
-            && !self
-                .heal_cursor_discarded
-                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        self.messages_healed() && !self.heal_cursor_discarded.swap(true, Ordering::Relaxed)
     }
 
     /// The resident chokepoint: the resident map, dropped first if the store's
@@ -2337,7 +2321,7 @@ impl Store {
     /// Purge this store's chains and build temps if no sibling holds the
     /// build lock; a held lock means a builder is already replacing them.
     fn purge_rowmaps_if_unlocked(cache_dir: &Path, store_key: &str) {
-        let lock_path = cache_dir.join(format!("rowmetamap-{store_key}.lock"));
+        let lock_path = RowMetaMap::lock_path(cache_dir, store_key);
         let Ok(lock) = std::fs::File::create(&lock_path) else {
             return;
         };
@@ -2563,7 +2547,7 @@ impl Store {
         version: u64,
         epoch: EraseEpoch,
     ) -> Result<Option<RowMetaSet>> {
-        let lock_path = cache_dir.join(format!("rowmetamap-{store_key}.lock"));
+        let lock_path = RowMetaMap::lock_path(cache_dir, store_key);
         let lock = std::fs::File::create(&lock_path)
             .with_context(|| format!("create rowmap build lock {}", lock_path.display()))?;
         match lock.try_lock() {
@@ -2580,8 +2564,7 @@ impl Store {
                 "messages was rolled back by self-heal; discarding cached rowmaps"
             );
             Self::purge_rowmaps(cache_dir, store_key);
-            self.heal_chains_purged
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.heal_chains_purged.store(true, Ordering::Relaxed);
         }
 
         // Re-check after acquiring: a sibling may have published `version`. An
@@ -3154,7 +3137,7 @@ impl Store {
     /// Scan the hydration columns with row ids straight into a segment file at
     /// `path`, folding each batch into the encoder and dropping it - the whole
     /// corpus never exists in memory at once, only the open block and the
-    /// dictionaries. One large sequential scan, same as `collect_row_metas`.
+    /// dictionaries. One large sequential scan, same as `collect_row_metas_from`.
     ///
     /// The scan is driven by an explicit fragment list, ordered so it yields
     /// ascending `row_id` - see [`Self::ascending_row_id_fragments`], which is
@@ -3309,15 +3292,18 @@ impl Store {
         })
     }
 
-    /// Scan the hydration columns with row ids into a `Vec`, the input to
-    /// `RowMetaMap::build`. The sorting fallback for `build_rowmap_from_scan`
-    /// (and the oracle the map-vs-scan tests compare against); `search_text`
-    /// dominates the bytes, so this holds the whole corpus and the streaming
-    /// path above is what a cold build normally takes.
-    pub async fn collect_row_metas(&self) -> Result<Vec<RowMetaEntry>> {
+    /// [`Self::collect_row_metas_from`] over the latest snapshot - the oracle
+    /// the map-vs-scan tests compare against.
+    #[cfg(test)]
+    pub(crate) async fn collect_row_metas(&self) -> Result<Vec<RowMetaEntry>> {
         Self::collect_row_metas_from(&self.handle.dataset(Table::Messages).await?).await
     }
 
+    /// Scan `dataset`'s hydration columns with row ids into a `Vec`, the input
+    /// to `RowMetaMap::build`. The sorting fallback for
+    /// `build_rowmap_from_scan`; `search_text` dominates the bytes, so this
+    /// holds the whole corpus and the streaming path above is what a cold
+    /// build normally takes.
     async fn collect_row_metas_from(dataset: &Dataset) -> Result<Vec<RowMetaEntry>> {
         let row_count = dataset.count_rows(None).await?;
         let mut scanner = dataset.scan();
@@ -9230,7 +9216,7 @@ mod tests {
     }
 
     fn hold_rowmap_lock(store: &Store, cache: &Path) -> anyhow::Result<std::fs::File> {
-        let path = cache.join(format!("rowmetamap-{}.lock", store.store_key()));
+        let path = RowMetaMap::lock_path(cache, &store.store_key());
         let lock = std::fs::File::create(path)?;
         lock.try_lock()?;
         Ok(lock)
@@ -10995,7 +10981,7 @@ mod tests {
         Ok(())
     }
 
-    /// F1, the regrow trap: an erase followed by enough appends to regrow the
+    /// The regrow trap: an erase followed by enough appends to regrow the
     /// row count used to extend the old base, keeping the erased rows. Under a
     /// new epoch the chain is rebuilt, so no erased row id is installed.
     #[tokio::test]
@@ -11208,7 +11194,7 @@ mod tests {
         Ok(())
     }
 
-    /// F12: a writer whose probe predates an erase's intent commit still
+    /// A writer whose probe predates an erase's intent commit still
     /// appends (a config commit cannot fence it), then sees the intent on the
     /// manifests its own commits landed on and reports the race.
     #[tokio::test]

@@ -66,9 +66,28 @@ struct Header {
     block_count: u64,
     blob_offset: u64,
     /// The erase epoch of the snapshot this segment was scanned from (see
-    /// [`EraseEpoch::to_header`]); a chain is usable only under that epoch.
+    /// [`epoch_to_header`]); a chain is usable only under that epoch.
     epoch: [u8; 16],
     epoch_state: u64,
+}
+
+/// An erase epoch's fixed-width header form: the uuid bytes plus a state word
+/// (0 never, 1 settled, 2 in flight).
+fn epoch_to_header(epoch: EraseEpoch) -> ([u8; 16], u64) {
+    match epoch {
+        EraseEpoch::Never => ([0; 16], 0),
+        EraseEpoch::Settled(bytes) => (bytes, 1),
+        EraseEpoch::InFlight => ([0; 16], 2),
+    }
+}
+
+fn epoch_from_header(bytes: [u8; 16], state: u64) -> Option<EraseEpoch> {
+    match state {
+        0 => Some(EraseEpoch::Never),
+        1 => Some(EraseEpoch::Settled(bytes)),
+        2 => Some(EraseEpoch::InFlight),
+        _ => None,
+    }
 }
 
 #[repr(C)]
@@ -258,6 +277,11 @@ impl RowMetaMap {
         cache_dir.join(format!("rowmetamap-{store_key}-d{version}.rmm"))
     }
 
+    /// The per-store build `flock` every chain writer and purger takes.
+    pub fn lock_path(cache_dir: &Path, store_key: &str) -> PathBuf {
+        cache_dir.join(format!("rowmetamap-{store_key}.lock"))
+    }
+
     /// Encode `entries` into a segment at `path`. Buffering entry point: the
     /// whole corpus is already owned here, so it sorts and replays into
     /// [`RowMetaBuilder`]. A caller that can stream rows in `row_id` order
@@ -301,7 +325,7 @@ impl RowMetaMap {
         let role_count = usize::try_from(header.role_count).context("role_count")?;
         let block_count = usize::try_from(header.block_count).context("block_count")?;
         let blob_offset = usize::try_from(header.blob_offset).context("blob_offset overflow")?;
-        let epoch = EraseEpoch::from_header(header.epoch, header.epoch_state)
+        let epoch = epoch_from_header(header.epoch, header.epoch_state)
             .with_context(|| format!("row meta map {} bad erase epoch", path.display()))?;
 
         let sessions_off = size_of::<Header>() + count * size_of::<Record>();
@@ -794,7 +818,7 @@ impl RowMetaBuilder {
             + sessions.len() * size_of::<SessionEntry>()
             + (projects.len() + agents.len() + roles.len()) * size_of::<DictEntry>()
             + self.block_entries.len() * size_of::<BlockEntry>()) as u64;
-        let (epoch, epoch_state) = self.epoch.to_header();
+        let (epoch, epoch_state) = epoch_to_header(self.epoch);
         let header = Header {
             magic: MAGIC,
             version: self.version,
@@ -2184,6 +2208,19 @@ mod tests {
         .unwrap();
         let chain = discover_chain(dir.path(), "e").unwrap();
         assert!(RowMetaSet::open(&chain).is_err());
+    }
+
+    #[test]
+    fn header_epoch_round_trips_and_rejects_unknown_states() {
+        for epoch in [
+            EraseEpoch::Never,
+            EraseEpoch::Settled([9; 16]),
+            EraseEpoch::InFlight,
+        ] {
+            let (bytes, state) = epoch_to_header(epoch);
+            assert_eq!(epoch_from_header(bytes, state), Some(epoch));
+        }
+        assert_eq!(epoch_from_header([0; 16], 3), None);
     }
 
     #[test]

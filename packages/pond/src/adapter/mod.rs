@@ -323,8 +323,11 @@ pub type PlanFuture<'a> = std::pin::Pin<
 /// process restart while another process builds that map. `None` makes the
 /// caller re-read.
 ///
-/// The skip is sound because pond and every source are append-only: a session's
-/// max message timestamp only advances as it gains messages. The one residual is
+/// The skip is sound because pond and every source are append-only within a
+/// session: a session's max message timestamp only advances as it gains
+/// messages. Erase, pond's one deletion, removes whole sessions and moves the
+/// erase epoch, which discards every watermark source built before it
+/// (spec.md#session-append-only-exception). The one residual is
 /// two messages sharing the exact micros across a sync boundary (negligible at
 /// sub-second precision, self-healing once any newer message arrives); `pond sync
 /// --verify` (which passes [`NoopOracle`]) is the full-re-read backstop.
@@ -370,27 +373,6 @@ pub fn erased_skip(oracle: &dyn SkipOracle, session_id: &str) -> Option<AdapterY
         project: None,
         reason: SkipReason::Erased,
     })
-}
-
-/// Any [`SkipOracle`] plus the store's erased ids - how a sync hands the
-/// freshness gate its denylist whichever watermark source it settled on.
-pub struct ErasedOracle {
-    pub inner: Box<dyn SkipOracle>,
-    pub erased: std::collections::HashSet<String>,
-}
-
-impl SkipOracle for ErasedOracle {
-    fn session_max_ts(&self, session_id: &str) -> Option<i64> {
-        self.inner.session_max_ts(session_id)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    fn is_erased(&self, session_id: &str) -> bool {
-        self.erased.contains(session_id)
-    }
 }
 
 /// `SkipOracle` that always returns `None`. Used by `--verify`, tests, and
@@ -997,10 +979,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        AdapterYield, EdgeFidelity, ErasedOracle, NoopOracle, RestoreFidelity, RestoredFile,
-        SkipOracle, SkipReason, SourceWatermark, SyncPlan, erased_skip, is_session_fresh, registry,
+        AdapterYield, EdgeFidelity, NoopOracle, RestoreFidelity, RestoredFile, SkipOracle,
+        SkipReason, SourceWatermark, SyncPlan, erased_skip, is_session_fresh, registry,
         validate_path_id, write_restored_files,
     };
+    use crate::erase::ErasedOracle;
 
     struct Watermarks(std::collections::HashMap<&'static str, i64>);
 

@@ -2885,15 +2885,12 @@ impl Handle {
     /// Insert the `entries` whose keys `table`'s config lacks, leaving every
     /// present key untouched. Disjoint config keys never conflict with data
     /// commits (Lance rebases `UpdateConfig` over them), so the retry only
-    /// re-reads under a same-key race. Returns how many keys were inserted.
+    /// re-reads under a same-key race.
     pub(crate) async fn insert_config_absent(
         &self,
         table: Table,
         entries: &[(String, String)],
-    ) -> Result<usize> {
-        if entries.is_empty() {
-            return Ok(0);
-        }
+    ) -> Result<()> {
         self.retry_lance(table.label(), || async {
             let mut cached = self.cached(table).await?.lock().await;
             let mut dataset = cached.latest().await?;
@@ -2903,14 +2900,14 @@ impl Handle {
                 .cloned()
                 .collect();
             if absent.is_empty() {
-                return Ok(0);
+                return Ok(());
             }
             dataset
-                .update_config(absent.clone())
+                .update_config(absent)
                 .await
                 .with_context(|| format!("update_config failed for {}", table.label()))?;
             cached.replace(dataset);
-            Ok(absent.len())
+            Ok(())
         })
         .await
     }

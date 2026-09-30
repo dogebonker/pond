@@ -10,10 +10,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::adapter::SkipOracle;
+
 /// Config key prefix of the portable intent: `pond.erased.<session_id>`,
 /// written on both `sessions` and `messages` and enforced as their union, so a
 /// rollback of either table alone cannot lift it.
-pub const ERASED_KEY_PREFIX: &str = "pond.erased.";
+pub(crate) const ERASED_KEY_PREFIX: &str = "pond.erased.";
 
 /// The value of an intent key. Enforcement keys on presence alone; the value
 /// only records when and through which named session the id was erased.
@@ -88,7 +90,7 @@ pub fn intent_to_import(
 }
 
 /// `messages` manifest config key holding the erase epoch.
-pub const EPOCH_KEY: &str = "pond.erase.epoch";
+pub(crate) const EPOCH_KEY: &str = "pond.erase.epoch";
 
 /// The store's erase epoch, as recorded by a derived signal (a rowmap chain,
 /// a sync cursor) or read from the live `messages` config.
@@ -126,24 +128,26 @@ impl EraseEpoch {
     pub fn admits(self, recorded: Self) -> bool {
         self != Self::InFlight && recorded == self
     }
+}
 
-    /// Fixed-width form for the rowmap segment header: the uuid bytes plus a
-    /// state word (0 never, 1 settled, 2 in flight).
-    pub(crate) fn to_header(self) -> ([u8; 16], u64) {
-        match self {
-            Self::Never => ([0; 16], 0),
-            Self::Settled(bytes) => (bytes, 1),
-            Self::InFlight => ([0; 16], 2),
-        }
+/// Any [`SkipOracle`] plus the store's erased ids - how a sync hands the
+/// freshness gate its denylist whichever watermark source it settled on.
+pub struct ErasedOracle {
+    pub inner: Box<dyn SkipOracle>,
+    pub erased: HashSet<String>,
+}
+
+impl SkipOracle for ErasedOracle {
+    fn session_max_ts(&self, session_id: &str) -> Option<i64> {
+        self.inner.session_max_ts(session_id)
     }
 
-    pub(crate) fn from_header(bytes: [u8; 16], state: u64) -> Option<Self> {
-        match state {
-            0 => Some(Self::Never),
-            1 => Some(Self::Settled(bytes)),
-            2 => Some(Self::InFlight),
-            _ => None,
-        }
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    fn is_erased(&self, session_id: &str) -> bool {
+        self.erased.contains(session_id)
     }
 }
 
@@ -240,18 +244,5 @@ mod tests {
         // In flight admits nothing, not even a signal built during the erase.
         assert!(!EraseEpoch::InFlight.admits(EraseEpoch::InFlight));
         assert!(!EraseEpoch::InFlight.admits(EraseEpoch::Never));
-    }
-
-    #[test]
-    fn header_form_round_trips_and_rejects_unknown_states() {
-        for epoch in [
-            EraseEpoch::Never,
-            EraseEpoch::Settled([9; 16]),
-            EraseEpoch::InFlight,
-        ] {
-            let (bytes, state) = epoch.to_header();
-            assert_eq!(EraseEpoch::from_header(bytes, state), Some(epoch));
-        }
-        assert_eq!(EraseEpoch::from_header([0; 16], 3), None);
     }
 }

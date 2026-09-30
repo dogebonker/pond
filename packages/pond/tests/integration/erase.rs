@@ -8,13 +8,12 @@
 use std::collections::BTreeMap;
 use std::future::{Ready, ready};
 use std::path::Path;
-use std::sync::Arc;
 
 use chrono::DateTime;
 use pond::{
-    adapter::{Adapter, ClaudeCodeAdapter, ErasedOracle, NoopOracle},
-    embed::{Embedder, LazyEmbedder},
-    erase::ErasedIntent,
+    adapter::{Adapter, ClaudeCodeAdapter, NoopOracle},
+    embed::LazyEmbedder,
+    erase::{ErasedIntent, ErasedOracle},
     handlers::{SyncEvent, SyncStatus, ingest_adapter, pond_get_session, pond_search},
     sessions::{IngestSummary, Store},
     substrate::MaintenancePolicy,
@@ -44,7 +43,7 @@ async fn sync_fixtures(store: &Store) -> anyhow::Result<IngestSummary> {
     .await
 }
 
-/// A fixture session with conversational text, so search can find it.
+/// The fixture corpus's session ids, sorted, read from a scratch store.
 async fn fixture_ids(temp: &TempDir) -> anyhow::Result<Vec<String>> {
     let scratch = Store::open_local(temp.path().join("scratch")).await?;
     sync_fixtures(&scratch).await?;
@@ -217,26 +216,6 @@ async fn archive_round_trip_carries_intent_and_withholds_erased_rows() -> anyhow
     Ok(())
 }
 
-struct FakeBackend;
-
-impl Embedder for FakeBackend {
-    fn device(&self) -> &str {
-        "fake"
-    }
-
-    fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
-        Ok(texts
-            .iter()
-            .map(|text| {
-                let seed = text.bytes().map(f32::from).sum::<f32>();
-                (0..pond::sessions::embedding_dim())
-                    .map(|index| ((seed + index as f32) * 0.37).sin())
-                    .collect()
-            })
-            .collect())
-    }
-}
-
 /// While rows of an erased session still exist (an anomaly window), search
 /// hides them and get-session treats the id as absent. (`pond_sql`, the raw
 /// escape hatch, is deliberately left unfiltered.)
@@ -249,7 +228,8 @@ async fn search_and_get_suppress_an_erased_session_with_rows() -> anyhow::Result
         .optimize_indices(None, &MaintenancePolicy::always_compact())
         .await?
         .into_result()?;
-    let embedder = LazyEmbedder::from_loaded(Arc::new(FakeBackend) as Arc<dyn Embedder>);
+    // FTS never loads the model, so the unloaded default embedder is enough.
+    let embedder = LazyEmbedder::candle();
     let search = |query: String| SearchRequest {
         protocol_version: pond::PROTOCOL_VERSION,
         namespace: Some("local".to_owned()),

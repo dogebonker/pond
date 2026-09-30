@@ -4796,14 +4796,17 @@ async fn with_erased(
     store: &Store,
     inner: Box<dyn pond::adapter::SkipOracle>,
 ) -> Box<dyn pond::adapter::SkipOracle> {
-    let erased = store.messages_erased_session_ids().await.unwrap_or_else(|error| {
-        tracing::warn!(%error, "could not read the erase denylist; erased sources are decoded and dropped at ingest");
-        Default::default()
-    });
+    let erased = store
+        .messages_erased_session_ids()
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "could not read the erase denylist; erased sources are decoded and dropped at ingest");
+            Default::default()
+        });
     if erased.is_empty() {
         return inner;
     }
-    Box::new(pond::adapter::ErasedOracle { inner, erased })
+    Box::new(pond::erase::ErasedOracle { inner, erased })
 }
 
 async fn usable_sync_cursor(store: &Store) -> Option<syncstate::SyncCursor> {
