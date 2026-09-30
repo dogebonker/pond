@@ -414,7 +414,7 @@ impl ParsedStatement {
     }
 }
 
-/// Read-only gate: parse the SQL and require exactly one top-level `Query` or
+/// Read-only gate (spec.md#protocol-sql-read-only): parse the SQL and require exactly one top-level `Query` or
 /// `EXPLAIN <Query>`. Rejects DDL/DML/COPY/SET/SHOW and multi-statement input,
 /// which `SQLOptions` alone does not catch at planning time. EXPLAIN of a
 /// non-Query (e.g. `EXPLAIN INSERT ...`) is also rejected: EXPLAIN itself is

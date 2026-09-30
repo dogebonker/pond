@@ -1101,7 +1101,8 @@ fn derived_target_rows(stats: &[FragmentStat]) -> usize {
         .clamp(1, u128::from(MAX_TARGET_ROWS_PER_FRAGMENT))) as usize
 }
 
-/// Name the first reason an optional compaction task cannot make progress.
+/// Name the first reason an optional compaction task cannot make progress
+/// (spec.md#lance-compaction-filter).
 /// Deletion materialization always passes because removing tombstones is useful.
 fn task_veto_reason(
     stats: &[FragmentStat],
@@ -3476,7 +3477,7 @@ async fn optimize_table_compact(
     Ok(())
 }
 
-/// Always `Reencode`, never binary copy: binary copy concatenates the input
+/// Always `Reencode`, never binary copy (spec.md#lance-compaction-filter): binary copy concatenates the input
 /// pages, so every tiny per-sync append survives as its own page, and lance 12
 /// reads each page's metadata on every take of a projected column (#285: a
 /// 20k-row `sessions` fragment with 2,057 pages/column cost 11,300 GETs per
@@ -5414,7 +5415,8 @@ fn classify_schema(
 /// Open-time schema reconciliation: a store missing this build's known
 /// nullable columns is backfilled IN PLACE via `Dataset::add_columns` - the
 /// values derive from data already stored, so no re-ingest is ever required
-/// (spec.md#session-durable-copy: a rotated source cannot supply rows again).
+/// (spec.md#session-durable-copy: a rotated source cannot supply rows again;
+/// spec.md#session-additive-schema-backfill).
 /// Concurrent openers race benignly: `add_columns` commits through OCC, a
 /// losing writer sees a conflict, re-checks out latest, and finds the columns
 /// present.
