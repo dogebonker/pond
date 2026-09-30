@@ -1375,8 +1375,18 @@ mod search_handler {
                 .await
                 .map_err(map_storage)
         };
-        let (candidates, searchable_in_scope) = tokio::try_join!(candidates_fut, scope_fut)?;
+        let erased_fut = async {
+            store
+                .messages_erased_session_ids()
+                .await
+                .map_err(map_storage)
+        };
+        let (mut candidates, searchable_in_scope, erased) =
+            tokio::try_join!(candidates_fut, scope_fut, erased_fut)?;
         stage!("arms+scope joined");
+        // A safety net over an erase's anomaly windows (spec.md#session-append-only-exception),
+        // dropped before the top-`limit` cut so pages and counts stay whole.
+        candidates.retain(|candidate| !erased.contains(&candidate.session_id));
 
         if candidates.is_empty() {
             return Ok(empty_response(searchable_in_scope));
@@ -1433,23 +1443,10 @@ mod search_handler {
         // subagent match beyond the window can still sit in `matched_total` (the
         // un-hydrated pool tail) - the accepted cost of not re-adding the
         // `source_agent` materialization the S3 request-law removed.
-        //
-        // Erased sessions drop out the same way. In steady state they have no
-        // rows, so this removes nothing; it covers an erase's anomaly windows
-        // and any index that still serves deleted rows before its rebuild
-        // (spec.md#session-append-only-exception). Not a caller filter, so
-        // prefilter pushdown is unaffected. `pond_sql` stays unfiltered.
-        let erased = store
-            .search_suppressed_sessions()
-            .await
-            .map_err(map_storage)?;
-        if plan.exclude_subagents || !erased.is_empty() {
+        if plan.exclude_subagents {
             let excluded: std::collections::HashSet<String> = metas
                 .iter()
-                .filter(|meta| {
-                    (plan.exclude_subagents && meta.source_agent.contains('/'))
-                        || erased.contains(&meta.session_id)
-                })
+                .filter(|meta| meta.source_agent.contains('/'))
                 .map(|meta| meta.session_id.clone())
                 .collect();
             if !excluded.is_empty() {
@@ -1468,7 +1465,7 @@ mod search_handler {
                         .len(),
                 );
                 selected.retain(|candidate| !excluded.contains(&candidate.session_id));
-                metas.retain(|meta| !excluded.contains(&meta.session_id));
+                metas.retain(|meta| !meta.source_agent.contains('/'));
                 if selected.is_empty() {
                     return Ok(empty_response(searchable_in_scope));
                 }
@@ -2832,7 +2829,7 @@ mod get_tests {
             root: "gone".to_owned(),
         };
         store
-            .import_erase_intent(&[intent.entry("gone")].into_iter().collect())
+            .import_erase_intent(std::future::ready(Ok([intent.entry("gone")].into())))
             .await?;
 
         let envelope = super::pond_ingest(

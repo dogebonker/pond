@@ -27,10 +27,15 @@ impl ErasedIntent {
     /// The `(key, value)` config entry denylisting `session_id`.
     pub fn entry(&self, session_id: &str) -> (String, String) {
         (
-            format!("{ERASED_KEY_PREFIX}{session_id}"),
+            intent_key(session_id),
             serde_json::to_string(self).unwrap_or_default(),
         )
     }
+}
+
+/// The config key denylisting `session_id`.
+pub(crate) fn intent_key(session_id: &str) -> String {
+    format!("{ERASED_KEY_PREFIX}{session_id}")
 }
 
 /// Every intent entry across `configs`, keyed by config key. The first config
@@ -85,9 +90,6 @@ pub fn intent_to_import(
 /// `messages` manifest config key holding the erase epoch.
 pub const EPOCH_KEY: &str = "pond.erase.epoch";
 
-/// Suffix marking an epoch whose erase is still running (`<op>:inflight`).
-const INFLIGHT_SUFFIX: &str = ":inflight";
-
 /// The store's erase epoch, as recorded by a derived signal (a rowmap chain,
 /// a sync cursor) or read from the live `messages` config.
 ///
@@ -105,21 +107,17 @@ pub enum EraseEpoch {
 }
 
 impl EraseEpoch {
-    /// The epoch a manifest config carries. A settled value is a uuid; any
-    /// other string still names a distinct epoch through its digest, so a
-    /// malformed value invalidates caches once instead of on every read.
+    /// The epoch a manifest config carries. Only a uuid is settled: anything
+    /// else - `<op>:inflight`, or a form a later binary writes - reads as in
+    /// flight, so an unrecognized value can never admit a stale signal.
     pub fn from_config(config: &HashMap<String, String>) -> Self {
-        match config.get(EPOCH_KEY) {
+        match config
+            .get(EPOCH_KEY)
+            .map(|value| uuid::Uuid::parse_str(value))
+        {
             None => Self::Never,
-            Some(value) if value.ends_with(INFLIGHT_SUFFIX) => Self::InFlight,
-            Some(value) => Self::Settled(match uuid::Uuid::parse_str(value) {
-                Ok(uuid) => *uuid.as_bytes(),
-                Err(_) => {
-                    let mut digest = [0u8; 16];
-                    digest.copy_from_slice(&blake3::hash(value.as_bytes()).as_bytes()[..16]);
-                    digest
-                }
-            }),
+            Some(Ok(uuid)) => Self::Settled(*uuid.as_bytes()),
+            Some(Err(_)) => Self::InFlight,
         }
     }
 
@@ -217,10 +215,17 @@ mod tests {
             EraseEpoch::from_config(&config(&uuid.to_string())),
             EraseEpoch::Settled(*uuid.as_bytes())
         );
-        let malformed = EraseEpoch::from_config(&config("not-a-uuid"));
-        assert!(matches!(malformed, EraseEpoch::Settled(_)));
-        assert_eq!(malformed, EraseEpoch::from_config(&config("not-a-uuid")));
-        assert_ne!(malformed, EraseEpoch::from_config(&config("other")));
+    }
+
+    /// Fail closed: a value this binary does not recognize - a malformed one,
+    /// or an in-flight form a later binary writes - admits no signal.
+    #[test]
+    fn an_unrecognized_epoch_reads_as_in_flight() {
+        for value in ["not-a-uuid", "", "op-7:running", "inflight:op-7"] {
+            let epoch = EraseEpoch::from_config(&config(value));
+            assert_eq!(epoch, EraseEpoch::InFlight, "{value:?}");
+            assert!(!epoch.admits(epoch));
+        }
     }
 
     #[test]

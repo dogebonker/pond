@@ -157,6 +157,10 @@ pub struct LanceArchiveExport {
 pub struct LanceArchiveImport {
     pub rows: LanceArchiveCounts,
     pub inserted: LanceArchiveCounts,
+    /// Erase intent keys this import added to the destination's denylist.
+    pub imported_intent: usize,
+    /// Source sessions left out because either end has erased them.
+    pub withheld_sessions: usize,
 }
 
 /// One table's slice of a store-to-store copy plan: which sessions' rows for
@@ -187,8 +191,8 @@ impl TablePlan {
 /// `source_sessions` is the full source session count - erased ones included -
 /// kept so the caller can tell "destination already up to date" (empty plan,
 /// non-empty source) from "empty source", and so each table can recognize a
-/// from-empty/resumed run (`append.len() == source_sessions`) and skip the
-/// per-session `IN` filter.
+/// from-empty/resumed run (`append.len() == source_sessions - withheld`) and
+/// skip the per-session `IN` filter.
 #[derive(Debug, Clone, Default)]
 pub struct DeltaPlan {
     pub sessions: TablePlan,
@@ -198,17 +202,17 @@ pub struct DeltaPlan {
     /// Source sessions left out because either end has erased them
     /// (spec.md#session-append-only-exception).
     pub withheld: usize,
-    /// Either end carries a denylist. The predicate-less wholesale scan is
-    /// then off: it would carry erased rows, including orphans a source that
-    /// crashed mid-erase still holds without their session row.
-    pub denylist_active: bool,
+    /// Every id either end has erased, source sessions or not. The wholesale
+    /// scan excludes them by `NOT IN`, which also drops orphan rows a source
+    /// that crashed mid-erase still holds without their session row.
+    pub erased: Vec<String>,
 }
 
 impl DeltaPlan {
-    /// The source session count that lets a table scan the source wholesale,
-    /// or `None` when a denylist forbids it.
-    fn wholesale_sessions(&self) -> Option<usize> {
-        (!self.denylist_active).then_some(self.source_sessions)
+    /// Whether `append` holds every source session this copy may carry, so the
+    /// table scans the source whole under one commit.
+    fn is_wholesale(&self, append: &[String]) -> bool {
+        append.len() == self.source_sessions - self.withheld
     }
 
     pub fn is_empty(&self) -> bool {
@@ -558,12 +562,20 @@ impl Store {
         // Merge the archive's erase intent first (never weakening this store's),
         // then withhold every session this store now has erased: an archive
         // taken before an erase must not bring it back.
-        self.import_erase_intent(&erase::intent_entries([
-            sessions_dataset.config(),
-            messages_dataset.config(),
-        ]))
-        .await?;
-        let erased = self.erased_session_ids().await?;
+        let imported_intent = self
+            .import_erase_intent(std::future::ready(Ok(erase::intent_entries([
+                sessions_dataset.config(),
+                messages_dataset.config(),
+            ]))))
+            .await?;
+        let erased: Vec<String> = self.erased_session_ids().await?.into_iter().collect();
+        let withheld_sessions = if erased.is_empty() {
+            0
+        } else {
+            sessions_dataset
+                .count_rows(Some(in_predicate("id", &erased).to_lance()))
+                .await?
+        };
         let (sessions, sessions_inserted) = self
             .import_clean_table(Table::Sessions, sessions_dataset, sessions_upgrade, &erased)
             .await?;
@@ -584,6 +596,8 @@ impl Store {
                 messages: messages_inserted,
                 parts: parts_inserted,
             },
+            imported_intent,
+            withheld_sessions,
         })
     }
 
@@ -643,20 +657,19 @@ impl Store {
         table: Table,
         dataset: Dataset,
         upgrade: Option<ColumnBackfill>,
-        erased: &HashSet<String>,
+        erased: &[String],
     ) -> Result<(usize, usize)> {
         // Force the destination table into existence up front: an empty
         // archive table yields zero batches, so merge_insert alone would
         // leave a lazily-created table (sessions or parts) missing on the destination.
         let _ = self.handle.dataset(table).await?;
         let mut scanner = dataset.scan();
-        if !erased.is_empty() {
-            let column = match table {
-                Table::Sessions => "id",
-                Table::Messages | Table::Parts => "session_id",
-            };
-            let erased: Vec<String> = erased.iter().cloned().collect();
-            scanner.filter(&Predicate::Not(Box::new(in_predicate(column, &erased))).to_lance())?;
+        let column = match table {
+            Table::Sessions => "id",
+            Table::Messages | Table::Parts => "session_id",
+        };
+        if let Some(predicate) = not_erased(column, erased) {
+            scanner.filter(&predicate.to_lance())?;
         }
         self.merge_scanner(table, scanner, "archive import", upgrade)
             .await
@@ -784,9 +797,11 @@ impl Store {
             self.erased_session_ids(),
         )?;
         let source_sessions = source_ids.len();
+        let mut erased: Vec<String> = source_erased.union(&dest_erased).cloned().collect();
+        erased.sort_unstable();
         let mut plan = DeltaPlan {
             source_sessions,
-            denylist_active: !source_erased.is_empty() || !dest_erased.is_empty(),
+            erased,
             ..DeltaPlan::default()
         };
         for id in &source_ids {
@@ -841,27 +856,9 @@ impl Store {
         // three-table `try_join!` (see `upsert_session_batch`).
         let ((sessions, sessions_inserted), (messages, messages_inserted), (parts, parts_inserted)) =
             tokio::try_join!(
-                self.copy_table(
-                    source,
-                    Table::Sessions,
-                    "id",
-                    &plan.sessions,
-                    plan.wholesale_sessions(),
-                ),
-                self.copy_table(
-                    source,
-                    Table::Messages,
-                    "session_id",
-                    &plan.messages,
-                    plan.wholesale_sessions(),
-                ),
-                self.copy_table(
-                    source,
-                    Table::Parts,
-                    "session_id",
-                    &plan.parts,
-                    plan.wholesale_sessions(),
-                ),
+                self.copy_table(source, Table::Sessions, "id", &plan.sessions, plan),
+                self.copy_table(source, Table::Messages, "session_id", &plan.messages, plan),
+                self.copy_table(source, Table::Parts, "session_id", &plan.parts, plan),
             )?;
         Ok(LanceArchiveImport {
             rows: LanceArchiveCounts {
@@ -874,6 +871,8 @@ impl Store {
                 messages: messages_inserted,
                 parts: parts_inserted,
             },
+            withheld_sessions: plan.withheld,
+            ..LanceArchiveImport::default()
         })
     }
 
@@ -887,7 +886,7 @@ impl Store {
         table: Table,
         key_column: &'static str,
         table_plan: &TablePlan,
-        wholesale_sessions: Option<usize>,
+        plan: &DeltaPlan,
     ) -> Result<(usize, usize)> {
         // Force the destination table into existence up front so a lazily
         // created table (sessions or parts) is never left missing when its slice
@@ -895,13 +894,7 @@ impl Store {
         let _ = self.handle.dataset(table).await?;
 
         let appended = self
-            .append_sessions(
-                source,
-                table,
-                key_column,
-                &table_plan.append,
-                wholesale_sessions,
-            )
+            .append_sessions(source, table, key_column, &table_plan.append, plan)
             .await?;
 
         // `Sessions` never reaches the merge bucket in the product path (its
@@ -936,24 +929,25 @@ impl Store {
     }
 
     /// Append one table's slice for the listed sessions. A from-empty or resumed
-    /// copy (`session_ids.len() == wholesale_sessions`: every session's rows for
-    /// this table are absent on the destination) scans the source wholesale
-    /// under one commit; a partial copy - or any copy under a denylist - chunks
-    /// the `IN` predicate (btree-pushed) but still commits once per chunk, not
-    /// per scan batch. Returns rows appended.
+    /// copy ([`DeltaPlan::is_wholesale`]: every carried session's rows for this
+    /// table are absent on the destination) scans the source wholesale under
+    /// one commit, excluding erased ids; a partial copy chunks the `IN`
+    /// predicate (btree-pushed) but still commits once per chunk, not per scan
+    /// batch. Returns rows appended.
     async fn append_sessions(
         &self,
         source: &Store,
         table: Table,
         key_column: &'static str,
         session_ids: &[String],
-        wholesale_sessions: Option<usize>,
+        plan: &DeltaPlan,
     ) -> Result<usize> {
         if session_ids.is_empty() {
             return Ok(0);
         }
-        if Some(session_ids.len()) == wholesale_sessions {
-            return self.append_scanner(source, table, None).await;
+        if plan.is_wholesale(session_ids) {
+            let predicate = not_erased(key_column, &plan.erased);
+            return self.append_scanner(source, table, predicate.as_ref()).await;
         }
         let mut rows = 0usize;
         for chunk in session_ids.chunks(COPY_SESSION_IN_CHUNK) {
@@ -1471,21 +1465,40 @@ impl Store {
         // fence the append (config commits rebase over appends), so the writer
         // checks what its own commits landed on - free, the manifests are in
         // hand - and reports the race for the erase's re-sweep to clean up.
+        // A batch that appended only parts moved neither intent replica, so it
+        // cannot see the race without a round trip; the re-sweep still can.
         let (sessions_config, messages_config) = tokio::try_join!(
             self.handle.committed_config(Table::Sessions),
             self.handle.committed_config(Table::Messages),
         )?;
         let erased_now = erase::enforced_ids([&sessions_config, &messages_config]);
         if !erased_now.is_empty() {
+            let wrote_rows = |substream: &CompletedSubstream| {
+                let id = &substream.session.id;
+                (substream.session_index.is_some() && !existing_sessions.contains_key(id))
+                    || substream.messages.iter().any(|buffered| {
+                        let message_id = buffered.message.id();
+                        !existing_message_pks.contains(&(id.clone(), message_id.to_owned()))
+                            || buffered.parts.iter().any(|part| {
+                                !existing_part_pks.contains(&(
+                                    id.clone(),
+                                    message_id.to_owned(),
+                                    part.part.id.clone(),
+                                ))
+                            })
+                    })
+            };
             let raced: BTreeSet<&str> = writeable
                 .iter()
+                .filter(|substream| erased_now.contains(&substream.session.id))
+                .filter(|substream| wrote_rows(substream))
                 .map(|substream| substream.session.id.as_str())
-                .filter(|id| erased_now.contains(*id))
                 .collect();
             if !raced.is_empty() {
                 tracing::warn!(
+                    count = raced.len(),
                     sessions = ?raced,
-                    "wrote rows of sessions erased while this batch was in flight; the erase's re-sweep removes them, or rerun `pond erase` on them"
+                    "wrote rows of sessions erased while this batch was in flight"
                 );
                 counts.wrote_erased += raced.len();
             }
@@ -1902,12 +1915,9 @@ impl Store {
     /// removes rows without necessarily moving the version past a map's, so
     /// the map also passes the erase-epoch gate in [`Self::resident_rowmap`].
     async fn session_scan_rows_resident(&self, session_id: &str) -> Result<Option<Vec<ScanRow>>> {
-        let Some(map) = self.resident_rowmap().await? else {
+        let Some(map) = self.current_resident_rowmap().await? else {
             return Ok(None);
         };
-        if map.version() != self.messages_version().await? {
-            return Ok(None);
-        }
         let Some(rowids) = map.session_row_ids(session_id) else {
             return Ok(None);
         };
@@ -1991,7 +2001,7 @@ impl Store {
         let session_id = self.session_id_for_stored_message(message_id).await?;
         // An erased session's messages resolve to nothing, like the session.
         match session_id {
-            Some(id) if self.erased_session_ids().await?.contains(&id) => Ok(None),
+            Some(id) if self.is_erased(&id).await? => Ok(None),
             other => Ok(other),
         }
     }
@@ -2179,7 +2189,7 @@ impl Store {
         Ok(())
     }
 
-    /// The store's current erase epoch (spec.md#session-movement-complete),
+    /// The store's current erase epoch (spec.md#session-append-only-exception),
     /// read from the `messages` manifest config the handle already holds.
     pub async fn erase_epoch(&self) -> Result<EraseEpoch> {
         let dataset = self.handle.dataset(Table::Messages).await?;
@@ -2188,8 +2198,9 @@ impl Store {
 
     /// Session ids this store has erased: the union of the `pond.erased.*`
     /// intent keys on `sessions` and `messages`
-    /// (spec.md#session-append-only-exception). Both configs ride on manifests
-    /// the handle already holds, so this costs no request of its own.
+    /// (spec.md#session-append-only-exception). Both configs ride on the
+    /// manifests the handle holds, so this reads nothing beyond the freshness
+    /// refresh any read of those tables pays.
     pub async fn erased_session_ids(&self) -> Result<HashSet<String>> {
         Ok(erase::intent_ids(&self.erase_intent().await?))
     }
@@ -2198,41 +2209,62 @@ impl Store {
     /// export hand to another store.
     pub async fn erase_intent(&self) -> Result<BTreeMap<String, String>> {
         let (sessions, messages) = tokio::try_join!(
-            self.handle.config(Table::Sessions),
-            self.handle.config(Table::Messages),
+            self.handle.dataset(Table::Sessions),
+            self.handle.dataset(Table::Messages),
         )?;
-        Ok(erase::intent_entries([&sessions, &messages]))
+        Ok(erase::intent_entries([
+            sessions.config(),
+            messages.config(),
+        ]))
     }
 
-    /// Search reads only `messages`, whose intent replica is enough to
-    /// suppress erased sessions at zero cost.
-    pub async fn search_suppressed_sessions(&self) -> Result<HashSet<String>> {
-        let messages = self.handle.config(Table::Messages).await?;
-        Ok(erase::enforced_ids([&messages]))
+    /// Whether this store has erased `session_id`: one key lookup per table,
+    /// cheap enough for per-session lookups.
+    pub async fn is_erased(&self, session_id: &str) -> Result<bool> {
+        let key = erase::intent_key(session_id);
+        let (sessions, messages) = tokio::try_join!(
+            self.handle.dataset(Table::Sessions),
+            self.handle.dataset(Table::Messages),
+        )?;
+        Ok(sessions.config().contains_key(&key) || messages.config().contains_key(&key))
     }
 
-    /// Merge intent arriving by copy or restore into both tables under the
-    /// never-weaken rule ([`erase::intent_to_import`]). Returns how many
-    /// session ids became newly erased here.
-    pub async fn import_erase_intent(&self, incoming: &BTreeMap<String, String>) -> Result<usize> {
-        let entries = erase::intent_to_import(&self.erase_intent().await?, incoming);
-        if entries.is_empty() {
-            return Ok(0);
+    /// The erased ids the `messages` replica carries, for callers that hold
+    /// only `messages` fresh and need the denylist as a safety net or a skip
+    /// hint (search, the sync oracle), never as the enforcement point.
+    pub async fn messages_erased_session_ids(&self) -> Result<HashSet<String>> {
+        let messages = self.handle.dataset(Table::Messages).await?;
+        Ok(erase::enforced_ids([messages.config()]))
+    }
+
+    /// Merge `incoming` intent (a copy source's, or an archive's) into both
+    /// tables under the never-weaken rule ([`erase::intent_to_import`]),
+    /// reading it concurrently with this store's own. Returns how many session
+    /// ids became newly erased here.
+    pub async fn import_erase_intent(
+        &self,
+        incoming: impl Future<Output = Result<BTreeMap<String, String>>>,
+    ) -> Result<usize> {
+        let (incoming, sessions, messages) = tokio::try_join!(
+            incoming,
+            self.handle.dataset(Table::Sessions),
+            self.handle.dataset(Table::Messages),
+        )?;
+        let held = erase::intent_entries([sessions.config(), messages.config()]);
+        let imported = erase::intent_to_import(&held, &incoming);
+        // Every held key too: a replica an earlier import left missing on one
+        // table (its second commit failed) is filled in rather than skipped.
+        let desired: Vec<(String, String)> =
+            held.into_iter().chain(imported.iter().cloned()).collect();
+        for (table, dataset) in [(Table::Sessions, sessions), (Table::Messages, messages)] {
+            if desired
+                .iter()
+                .any(|(key, _)| !dataset.config().contains_key(key))
+            {
+                self.handle.insert_config_absent(table, &desired).await?;
+            }
         }
-        // Sessions first, the table the ingest chokepoint consults.
-        self.handle
-            .insert_config_absent(Table::Sessions, &entries)
-            .await?;
-        self.handle
-            .insert_config_absent(Table::Messages, &entries)
-            .await?;
-        Ok(entries.len())
-    }
-
-    /// Carry `source`'s intent into this store - the intent half of a copy.
-    pub async fn copy_erase_intent_from(&self, source: &Store) -> Result<usize> {
-        self.import_erase_intent(&source.erase_intent().await?)
-            .await
+        Ok(imported.len())
     }
 
     /// Whether local self-heal rolled `messages` back when this store opened.
@@ -2270,6 +2302,19 @@ impl Store {
             return Ok(None);
         }
         Ok(self.resident_rowmap_under(self.erase_epoch().await?))
+    }
+
+    /// [`Self::resident_rowmap`], and only while it is also at the `messages`
+    /// HEAD version - both gates read off one snapshot.
+    async fn current_resident_rowmap(&self) -> Result<Option<Arc<RowMetaSet>>> {
+        if self.rowmap.load().is_none() {
+            return Ok(None);
+        }
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        let version = dataset.version().version;
+        Ok(self
+            .resident_rowmap_under(EraseEpoch::from_config(dataset.config()))
+            .filter(|map| map.version() == version))
     }
 
     fn resident_rowmap_under(&self, epoch: EraseEpoch) -> Option<Arc<RowMetaSet>> {
@@ -2348,6 +2393,13 @@ impl Store {
             .extend_rowmap_coordinated(cache_dir, &store_key, version, epoch)
             .await?
         {
+            // A full rebuild records the epoch of its own scan, which an erase
+            // may have moved since `epoch` was read; installing that chain
+            // would serve a map this call's epoch never vouched for.
+            if !epoch.admits(set.epoch()) {
+                Self::purge_rowmaps_if_unlocked(cache_dir, &store_key);
+                return Ok(RowmapEnsure::Contended);
+            }
             self.rowmap.store(Some(Arc::new(set)));
             return Ok(RowmapEnsure::Current);
         }
@@ -2360,7 +2412,7 @@ impl Store {
     /// sync re-examine rows appended since that map's version.
     pub async fn sync_rowmap_oracle(&self, cache_dir: &Path) -> Result<RowmapOracle> {
         let oracle = match self.ensure_rowmap_inner(cache_dir).await? {
-            RowmapEnsure::Current => RowmapOracle(self.rowmap_snapshot()),
+            RowmapEnsure::Current => RowmapOracle(self.resident_rowmap().await?),
             RowmapEnsure::Contended => {
                 let oracle = self.trailing_rowmap_oracle(cache_dir).await?;
                 if let Some(set) = oracle.0.as_ref() {
@@ -2467,11 +2519,20 @@ impl Store {
         {
             return Ok(());
         }
-        if let Some(chain) = discover_chain(cache_dir, &self.store_key())
-            && chain.version() == version
-            && let Ok(set) = RowMetaSet::open(&chain)
-            && self.chain_admitted(&set, epoch)
-        {
+        let store_key = self.store_key();
+        let Some(chain) = discover_chain(cache_dir, &store_key) else {
+            return Ok(());
+        };
+        let Ok(set) = RowMetaSet::open(&chain) else {
+            return Ok(());
+        };
+        // A search-only host never builds, so it must purge a chain an erase
+        // invalidated itself, or the erased rows' text stays on its disk.
+        if !self.chain_admitted(&set, epoch) {
+            Self::purge_rowmaps_if_unlocked(cache_dir, &store_key);
+            return Ok(());
+        }
+        if chain.version() == version {
             // Guarded like the sync paths, and for a sharper reason: this map
             // is what search hydration reads message ids out of, so a chain
             // left by a previous store at this path would not merely gate
@@ -3824,9 +3885,7 @@ impl Store {
         // unlike meta hydration, a count cannot detect staleness by a row-id
         // miss, so a map that predates appended rows would undercount. A stale
         // or absent map falls through to the IN-scan.
-        if let Some(map) = self.resident_rowmap().await?
-            && map.version() == self.messages_version().await?
-        {
+        if let Some(map) = self.current_resident_rowmap().await? {
             return Ok(session_ids
                 .iter()
                 .map(|id| (id.clone(), map.lookup_count(id).unwrap_or(0)))
@@ -4281,7 +4340,7 @@ impl Store {
     /// anomaly window (a racing write, a self-heal rollback): every get,
     /// resume and restore goes through this lookup, so none of them serves it.
     pub(crate) async fn find_session(&self, session_id: &str) -> Result<Option<Session>> {
-        if self.erased_session_ids().await?.contains(session_id) {
+        if self.is_erased(session_id).await? {
             return Ok(None);
         }
         let batch = self
@@ -4547,7 +4606,7 @@ pub struct IngestSummary {
     pub denylisted: usize,
     /// Sessions a flush wrote rows for although an erase denylisted them while
     /// the flush was in flight. Non-zero only under that race; the erase's
-    /// re-sweep, or a rerun of `pond erase`, removes the rows.
+    /// re-sweep removes the rows.
     pub wrote_erased: usize,
     /// Files the adapter couldn't decode at all (no Session header
     /// extractable: empty `.jsonl`, missing required field).
@@ -5813,6 +5872,11 @@ fn in_predicate(column: &'static str, values: &[String]) -> Predicate {
         column,
         values.iter().cloned().map(ScalarValue::String).collect(),
     )
+}
+
+/// `column NOT IN erased`, or no predicate when nothing is erased.
+fn not_erased(column: &'static str, erased: &[String]) -> Option<Predicate> {
+    (!erased.is_empty()).then(|| Predicate::Not(Box::new(in_predicate(column, erased))))
 }
 
 /// The kNN prefilter is the caller's scalar filter alone - pond does NOT add
@@ -11182,36 +11246,52 @@ mod tests {
         let plan = dest.plan_incremental_from(&source).await?;
         assert_eq!(plan.source_sessions, 3, "the source count stays unfiltered");
         assert_eq!(plan.withheld, 2);
-        assert!(plan.denylist_active);
+        assert_eq!(plan.erased, vec!["a".to_owned(), "b".to_owned()]);
         assert_eq!(plan.sessions.append, vec!["c".to_owned()]);
         assert_eq!(plan.messages.append, vec!["c".to_owned()]);
-        assert_eq!(plan.wholesale_sessions(), None, "no predicate-less scan");
 
         dest.copy_delta_from(&source, &plan).await?;
         assert_eq!(dest.session_ids().await?, vec!["c".to_owned()]);
         Ok(())
     }
 
-    /// A source that crashed mid-erase can hold orphan rows of an erased
-    /// session with no session row. Only the wholesale scan would carry them,
-    /// and it is off whenever a denylist exists.
+    /// A denylist keeps the one-commit wholesale scan, which excludes erased
+    /// ids by `NOT IN` - including orphan rows a source that crashed mid-erase
+    /// still holds without their session row.
     #[tokio::test]
-    async fn a_denylist_disables_the_wholesale_copy_scan() -> anyhow::Result<()> {
+    async fn a_denylisted_copy_scans_wholesale_without_erased_rows() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let source = Store::open_local(temp.path().join("source")).await?;
         let dest = Store::open_local(temp.path().join("dest")).await?;
-        ingest_events(&source, conversational_events("kept", 1)).await?;
-        ingest_events(&source, conversational_events("orphan", 1)).await?;
+        for id in ["kept", "gone", "orphan", "stray"] {
+            ingest_events(&source, conversational_events(id, 1)).await?;
+        }
         source
             .handle
-            .delete_rows(Table::Sessions, "id = 'orphan'")
+            .delete_rows(Table::Sessions, "id IN ('orphan', 'stray')")
             .await?;
+        erase_on(&source, &[Table::Sessions, Table::Messages], "gone").await?;
         erase_on(&source, &[Table::Sessions, Table::Messages], "orphan").await?;
 
         let plan = dest.plan_incremental_from(&source).await?;
         assert_eq!(plan.messages.append, vec!["kept".to_owned()]);
+        assert!(plan.is_wholesale(&plan.messages.append));
         dest.copy_delta_from(&source, &plan).await?;
-        assert_eq!(dest.handle.count_rows(Table::Messages).await?, 1);
+
+        // Only the wholesale scan carries `stray`, whose session row is gone
+        // but which nobody erased, so its rows prove which path ran.
+        let copied: BTreeSet<String> = dest
+            .all_session_message_counts()
+            .await?
+            .into_keys()
+            .collect();
+        assert_eq!(
+            copied,
+            BTreeSet::from(["kept".to_owned(), "stray".to_owned()])
+        );
+        let copied_parts: BTreeSet<String> =
+            dest.all_session_part_counts().await?.into_keys().collect();
+        assert_eq!(copied_parts, copied);
         Ok(())
     }
 
@@ -11252,7 +11332,12 @@ mod tests {
             ("pond.erase.op.x".to_owned(), "{}".to_owned()),
             (crate::erase::EPOCH_KEY.to_owned(), SETTLED_EPOCH.to_owned()),
         ]);
-        assert_eq!(store.import_erase_intent(&incoming).await?, 1);
+        assert_eq!(
+            store
+                .import_erase_intent(std::future::ready(Ok(incoming)))
+                .await?,
+            1
+        );
         let held = store.erase_intent().await?;
         assert_eq!(
             held.get(&key),
@@ -11261,11 +11346,17 @@ mod tests {
         );
         assert_eq!(held.len(), 2);
         let (sessions, messages) = (
-            store.handle.config(Table::Sessions).await?,
-            store.handle.config(Table::Messages).await?,
+            store.handle.dataset(Table::Sessions).await?,
+            store.handle.dataset(Table::Messages).await?,
         );
+        let (sessions, messages) = (sessions.config(), messages.config());
         let (fresh_key, _) = intent("foreign-root", "fresh");
         assert!(sessions.contains_key(&fresh_key) && messages.contains_key(&fresh_key));
+        assert_eq!(
+            messages.get(&key),
+            Some(&local),
+            "a replica an earlier import left missing is filled from the held value",
+        );
         assert!(!messages.contains_key("pond.erase.op.x"));
         assert!(!messages.contains_key(crate::erase::EPOCH_KEY));
         Ok(())

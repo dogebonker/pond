@@ -6,6 +6,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::BTreeMap;
+use std::future::{Ready, ready};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -25,12 +26,12 @@ use crate::support::sandboxed_pond;
 
 const FIXTURES: &str = "tests/fixtures/adapter/claude_code/projects";
 
-fn intent(session_id: &str) -> BTreeMap<String, String> {
-    BTreeMap::from([ErasedIntent {
+fn intent(session_id: &str) -> Ready<anyhow::Result<BTreeMap<String, String>>> {
+    ready(Ok(BTreeMap::from([ErasedIntent {
         at: DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
         root: session_id.to_owned(),
     }
-    .entry(session_id)])
+    .entry(session_id)])))
 }
 
 async fn sync_fixtures(store: &Store) -> anyhow::Result<IngestSummary> {
@@ -59,7 +60,7 @@ async fn sync_never_imports_an_erased_session_and_the_plan_counts_it() -> anyhow
     let erased = ids[0].clone();
 
     let store = Store::open_local(temp.path().join("store")).await?;
-    store.import_erase_intent(&intent(&erased)).await?;
+    store.import_erase_intent(intent(&erased)).await?;
     let mut reported_erased = Vec::new();
     let summary = ingest_adapter(
         &store,
@@ -121,8 +122,8 @@ fn pond_copy(temp: &TempDir, from: &Path, to: &Path, verify_only: bool) -> std::
 
 /// `pond copy` carries the source's intent, withholds the erased session, and
 /// its closing verify reports the withheld rows instead of calling them
-/// missing. Erased rows already on a destination are reported with the repair,
-/// and neither case fails the copy.
+/// missing. Erased rows already on a destination are reported by session, and
+/// neither case fails the copy.
 #[tokio::test(flavor = "multi_thread")]
 async fn copy_withholds_erased_sessions_both_ways() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
@@ -132,7 +133,7 @@ async fn copy_withholds_erased_sessions_both_ways() -> anyhow::Result<()> {
         let source = Store::open_local(&source_path).await?;
         sync_fixtures(&source).await?;
         // The rows stay: a source whose erase never ran its purge.
-        source.import_erase_intent(&intent(&ids[0])).await?;
+        source.import_erase_intent(intent(&ids[0])).await?;
     }
 
     let output = pond_copy(&temp, &source_path, &dest_path, false);
@@ -149,15 +150,19 @@ async fn copy_withholds_erased_sessions_both_ways() -> anyhow::Result<()> {
         assert!(!dest.session_ids().await?.contains(&ids[0]));
         assert!(dest.erased_session_ids().await?.contains(&ids[0]));
         // The destination erases a session it already holds.
-        dest.import_erase_intent(&intent(&ids[1])).await?;
+        dest.import_erase_intent(intent(&ids[1])).await?;
     }
 
     let output = pond_copy(&temp, &source_path, &dest_path, true);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert!(
-        stderr.contains(&format!("pond erase {}", ids[1])),
-        "the erased rows on the destination name their repair: {stderr}"
+        stderr.contains("destination still holds") && stderr.contains(&ids[1]),
+        "the erased rows on the destination are named: {stderr}"
+    );
+    assert!(
+        !stderr.contains("pond erase"),
+        "no command this binary lacks: {stderr}"
     );
     Ok(())
 }
@@ -180,7 +185,7 @@ async fn archive_round_trip_carries_intent_and_withholds_erased_rows() -> anyhow
     let erased_path = temp.path().join("erased");
     Store::open_local(&erased_path)
         .await?
-        .import_erase_intent(&intent(&ids[0]))
+        .import_erase_intent(intent(&ids[0]))
         .await?;
     let output = pond_copy(&temp, &before_erase, &erased_path, false);
     assert!(
@@ -293,7 +298,7 @@ async fn search_and_get_suppress_an_erased_session_with_rows() -> anyhow::Result
             .contains(&target)
     );
 
-    store.import_erase_intent(&intent(&target)).await?;
+    store.import_erase_intent(intent(&target)).await?;
     assert!(
         !hit_sessions(pond_search(&store, &embedder, search(word), &search_config).await)
             .contains(&target)

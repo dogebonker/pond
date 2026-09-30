@@ -2874,13 +2874,6 @@ impl Handle {
         cached.latest().await
     }
 
-    /// `table`'s manifest config through the freshness gate. The map rides on
-    /// the manifest the handle already holds, so this costs no request beyond
-    /// the refresh any read would pay.
-    pub(crate) async fn config(&self, table: Table) -> Result<HashMap<String, String>> {
-        Ok(self.dataset(table).await?.config().clone())
-    }
-
     /// The config of the manifest this handle last committed or refreshed to,
     /// without a refresh - right after a write, the writer's own commit. Free:
     /// a writer uses it to see what its commit landed on top of.

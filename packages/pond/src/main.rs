@@ -2895,15 +2895,6 @@ async fn run_store_to_store_copy(
     );
     spinner.enable_steady_tick(Duration::from_millis(120));
 
-    // Intent travels before planning, so the destination never weakens its
-    // denylist and the plan withholds every session either end erased.
-    let imported_intent = to_store.copy_erase_intent_from(&from_store).await?;
-    if imported_intent > 0 {
-        spinner.println(format!(
-            "{} {imported_intent} erased sessions denylisted on the destination",
-            pond::output::paint("erase:", dim),
-        ));
-    }
     spinner.set_message("plan  comparing source <-> destination");
     let plan_started = std::time::Instant::now();
     // Incremental: transfer only the sessions absent or grown on the
@@ -2921,6 +2912,17 @@ async fn run_store_to_store_copy(
             "source store {} has 0 sessions; check --from (a mistyped source opens as an empty store)",
             from_resolved.display(),
         );
+    }
+    // Intent lands before any row, so the destination never weakens its
+    // denylist; the plan already withholds every session either end erased.
+    let imported_intent = to_store
+        .import_erase_intent(from_store.erase_intent())
+        .await?;
+    if imported_intent > 0 {
+        spinner.println(format!(
+            "{} {imported_intent} erased sessions denylisted on the destination",
+            pond::output::paint("erase:", dim),
+        ));
     }
     let new_sessions = plan.new_sessions();
     let grown_sessions = plan.total().saturating_sub(new_sessions);
@@ -3005,7 +3007,7 @@ async fn run_store_to_store_copy(
                 verify.total_duplicates(),
             ),
         ))?;
-        render_erase_verify(&verify, &to_resolved.display())?;
+        render_erase_verify(&verify)?;
     } else {
         output(&stage_line(verify_elapsed, "verify", "FAILED"))?;
         render_storage_verify(&verify, &from_resolved.display(), &to_resolved.display())?;
@@ -3092,6 +3094,20 @@ async fn copy_archive_to_store(path: &Path, to: StorageUrl, loaded: &Config) -> 
     let summary = import_pond_archive(&store, path).await?;
     render_copy_import(&summary)?;
     let dim = pond::output::dim();
+    if summary.imported_intent > 0 {
+        output(&format!(
+            "{} {} erased sessions denylisted on the destination",
+            pond::output::paint("erase:", dim),
+            summary.imported_intent,
+        ))?;
+    }
+    if summary.withheld_sessions > 0 {
+        output(&format!(
+            "{} {} erased sessions withheld from the restore",
+            pond::output::paint("erase:", dim),
+            summary.withheld_sessions,
+        ))?;
+    }
     let policy = configured_maintenance_policy(loaded, None)?;
     // Same finalize seam as optimize/sync; the archive carries embeddings as
     // data columns, so finalize's embed pass no-ops (or fills the backlog if the
@@ -3991,9 +4007,9 @@ async fn verify_stores(from: &Store, to: &Store) -> anyhow::Result<StorageVerify
 }
 
 /// The erase half of a verify verdict: withheld source rows are reported as
-/// intended, and erased rows the destination still holds are named with the
-/// command that purges them. Neither fails the verify.
-fn render_erase_verify(verify: &StorageVerify, to_display: &str) -> anyhow::Result<()> {
+/// intended, and erased rows the destination still holds are named by session.
+/// Neither fails the verify.
+fn render_erase_verify(verify: &StorageVerify) -> anyhow::Result<()> {
     use pond::output::{dim, paint, yellow};
     if verify.withheld_rows > 0 {
         output(&format!(
@@ -4009,10 +4025,10 @@ fn render_erase_verify(verify: &StorageVerify, to_display: &str) -> anyhow::Resu
             .iter()
             .cloned()
             .collect::<Vec<_>>()
-            .join(" ");
+            .join(", ");
         output_err(&paint(
             &format!(
-                "verify: destination holds {} rows of {} erased sessions - run `pond erase {ids} --storage-path {to_display}` to purge them",
+                "verify: destination still holds {} rows of {} erased sessions: {ids}",
                 format_thousands(verify.erased_present as u64),
                 format_thousands(verify.erased_sessions.len() as u64),
             ),
@@ -4027,7 +4043,7 @@ fn render_erase_verify(verify: &StorageVerify, to_display: &str) -> anyhow::Resu
 /// nothing. The `run_copy` guard catches a missing local path; this catches
 /// the remote/empty case for parity (spec.md#session-durable-copy).
 fn ensure_source_not_empty(verify: &StorageVerify, from_display: &str) -> anyhow::Result<()> {
-    if verify.total_source_rows() == 0 {
+    if verify.total_source_rows() == 0 && verify.withheld_rows == 0 {
         bail!(
             "source store {from_display} has 0 rows; check --from (a mistyped source opens as an empty store)"
         );
@@ -4044,7 +4060,7 @@ fn render_storage_verify(
     to_display: &str,
 ) -> anyhow::Result<VerifyOutcome> {
     use pond::output::{dim, paint};
-    render_erase_verify(verify, to_display)?;
+    render_erase_verify(verify)?;
     if verify.synced() {
         let detail = verify
             .tables
@@ -4774,12 +4790,13 @@ async fn sync_skip_oracle(store: &Store, quiet: bool) -> Box<dyn pond::adapter::
 
 /// `inner` plus the store's erased ids, so erased sessions skip undecoded and
 /// never count as pending. An optimization only: the ingest chokepoint drops
-/// their rows regardless, so a failed read degrades to decoding them.
+/// their rows regardless, so the cheap `messages` replica suffices and a
+/// failed read degrades to decoding them.
 async fn with_erased(
     store: &Store,
     inner: Box<dyn pond::adapter::SkipOracle>,
 ) -> Box<dyn pond::adapter::SkipOracle> {
-    let erased = store.erased_session_ids().await.unwrap_or_else(|error| {
+    let erased = store.messages_erased_session_ids().await.unwrap_or_else(|error| {
         tracing::warn!(%error, "could not read the erase denylist; erased sources are decoded and dropped at ingest");
         Default::default()
     });
@@ -9001,29 +9018,20 @@ mod tests {
             missing: 0,
             dest_duplicates: 0,
         };
-        let empty = StorageVerify {
-            tables: vec![table(0)],
+        let verify = |source_rows, withheld_rows| StorageVerify {
+            tables: vec![table(source_rows)],
             dest_indexes: IndexCoverage {
                 fts_present: false,
                 vector_present_or_below_activation: true,
             },
-            withheld_rows: 0,
+            withheld_rows,
             withheld_sessions: BTreeSet::new(),
             erased_present: 0,
             erased_sessions: BTreeSet::new(),
         };
-        assert!(ensure_source_not_empty(&empty, "s3://typo/bucket").is_err());
-        let populated = StorageVerify {
-            tables: vec![table(3)],
-            dest_indexes: IndexCoverage {
-                fts_present: false,
-                vector_present_or_below_activation: true,
-            },
-            withheld_rows: 0,
-            withheld_sessions: BTreeSet::new(),
-            erased_present: 0,
-            erased_sessions: BTreeSet::new(),
-        };
-        assert!(ensure_source_not_empty(&populated, "local").is_ok());
+        assert!(ensure_source_not_empty(&verify(0, 0), "s3://typo/bucket").is_err());
+        assert!(ensure_source_not_empty(&verify(3, 0), "local").is_ok());
+        // Every source row withheld as erased is a populated source, not a typo.
+        assert!(ensure_source_not_empty(&verify(0, 4), "local").is_ok());
     }
 }
