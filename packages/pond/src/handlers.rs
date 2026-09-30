@@ -145,6 +145,9 @@ mod ingest_handler {
         /// source's documented migration contract). Counted in
         /// `skipped_superseded`, never folded into `Empty`.
         Superseded,
+        /// The store has erased this session: skipped undecoded (counted in
+        /// `skipped_erased`) or withheld at ingest (its rows in `denylisted`).
+        Erased,
         /// Transcript is unavailable by the adapter's documented contract.
         Unimportable {
             reason: String,
@@ -287,6 +290,10 @@ mod ingest_handler {
                             summary.skipped_superseded += 1;
                             SyncStatus::Superseded
                         }
+                        SkipReason::Erased => {
+                            summary.skipped_erased += 1;
+                            SyncStatus::Erased
+                        }
                         SkipReason::Unsupported(reason) => {
                             summary.skipped_files += 1;
                             if summary.first_skip_reason.is_none() {
@@ -320,6 +327,10 @@ mod ingest_handler {
                         SkipReason::Superseded => {
                             summary.skipped_superseded += count;
                             SyncStatus::Superseded
+                        }
+                        SkipReason::Erased => {
+                            summary.skipped_erased += count;
+                            SyncStatus::Erased
                         }
                         SkipReason::Unsupported(reason) => {
                             summary.skipped_files += count;
@@ -510,6 +521,7 @@ mod ingest_handler {
             skipped_files = summary.skipped_files as u64,
             skipped_fresh = summary.skipped_fresh as u64,
             skipped_superseded = summary.skipped_superseded as u64,
+            skipped_erased = summary.skipped_erased as u64,
             truncated_values = summary.truncated_values as u64,
             "ingest_adapter complete"
         );
@@ -556,6 +568,10 @@ mod ingest_handler {
             });
             let status = if let Some(reason) = rejection_reason {
                 SyncStatus::Rejected { reason }
+            } else if session_outcome
+                .is_some_and(|outcome| matches!(outcome.status, OutcomeStatus::Denylisted))
+            {
+                SyncStatus::Erased
             } else if done.dropped_events > 0 {
                 SyncStatus::Partial {
                     dropped_events: done.dropped_events,

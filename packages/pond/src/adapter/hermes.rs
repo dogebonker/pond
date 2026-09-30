@@ -283,6 +283,10 @@ impl Adapter for HermesAdapter {
 
             let mut survivors = Vec::with_capacity(entries.len());
             for entry in entries {
+                if let Some(skip) = crate::adapter::erased_skip(oracle, &entry.session_id) {
+                    yield Ok(skip);
+                    continue;
+                }
                 if is_session_fresh(oracle, &entry.session_id, entry.source_ts) {
                     yield Ok(AdapterYield::Skipped {
                         session_id: Some(entry.session_id),

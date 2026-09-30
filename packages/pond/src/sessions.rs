@@ -4577,6 +4577,8 @@ pub struct IngestSummary {
     pub skipped_superseded: usize,
     /// Sessions excluded by the adapter's documented ingestion contract.
     pub skipped_unimportable: usize,
+    /// Sessions skipped undecoded because the store has erased them.
+    pub skipped_erased: usize,
     /// Oversized values truncated to a bounded sentinel at the seam
     /// (spec.md#adapter-bounded-values); the rest of each such record is intact.
     pub truncated_values: usize,
@@ -4686,6 +4688,7 @@ impl IngestSummary {
         self.skipped_fresh += other.skipped_fresh;
         self.skipped_superseded += other.skipped_superseded;
         self.skipped_unimportable += other.skipped_unimportable;
+        self.skipped_erased += other.skipped_erased;
         self.truncated_values += other.truncated_values;
         for (key, value) in &other.drop_reasons {
             *self.drop_reasons.entry(key).or_insert(0) += value;

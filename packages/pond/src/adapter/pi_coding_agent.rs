@@ -1285,6 +1285,10 @@ fn sqlite_events<'a>(db_path: PathBuf, oracle: &'a dyn SkipOracle) -> AdapterYie
         let mut survivors = Vec::with_capacity(heads.len());
         let mut fresh = 0usize;
         for (session, watermark) in heads {
+            if let Some(skip) = crate::adapter::erased_skip(oracle, &session.id) {
+                yield Ok(skip);
+                continue;
+            }
             if is_session_fresh(oracle, &session.id, watermark) {
                 fresh += 1;
                 continue;

@@ -4753,10 +4753,7 @@ async fn run_sync_stages(
 /// the empty map yields no watermark and every source re-reads (safe, just
 /// slower).
 ///
-/// Whichever watermark source it settles on is wrapped with the store's erased
-/// ids, so erased sessions skip undecoded. That is an optimization only: the
-/// ingest chokepoint drops their rows regardless, so a failed read degrades to
-/// decoding them.
+/// Whichever watermark source it settles on goes through [`with_erased`].
 async fn sync_skip_oracle(store: &Store, quiet: bool) -> Box<dyn pond::adapter::SkipOracle> {
     // Here, not in `usable_sync_cursor`: a cycle served by the rowmap never
     // reads the cursor, and `persist_sync_cursor` would keep the stale one.
@@ -4772,6 +4769,16 @@ async fn sync_skip_oracle(store: &Store, quiet: bool) -> Box<dyn pond::adapter::
             None => Box::new(rowmap),
         }
     };
+    with_erased(store, inner).await
+}
+
+/// `inner` plus the store's erased ids, so erased sessions skip undecoded and
+/// never count as pending. An optimization only: the ingest chokepoint drops
+/// their rows regardless, so a failed read degrades to decoding them.
+async fn with_erased(
+    store: &Store,
+    inner: Box<dyn pond::adapter::SkipOracle>,
+) -> Box<dyn pond::adapter::SkipOracle> {
     let erased = store.erased_session_ids().await.unwrap_or_else(|error| {
         tracing::warn!(%error, "could not read the erase denylist; erased sources are decoded and dropped at ingest");
         Default::default()
@@ -5029,11 +5036,13 @@ fn add_drop_reasons(summary: &mut Value, report: &SyncReport) -> anyhow::Result<
     Ok(())
 }
 
-/// Rows withheld because their session is erased here, and sessions a flush
-/// wrote while an erase denylisted them mid-flight - both only when non-zero.
+/// Sessions skipped undecoded and rows withheld at ingest because their session
+/// is erased here, and sessions a flush wrote while an erase denylisted them
+/// mid-flight - each only when non-zero.
 fn add_erase_counts(summary: &mut Value, report: &SyncReport) {
     if let Value::Object(map) = summary {
         for (key, count) in [
+            ("skipped_erased", report.ingest.skipped_erased),
             ("denylisted", report.ingest.denylisted),
             ("wrote_erased", report.ingest.wrote_erased),
         ] {
@@ -6481,6 +6490,11 @@ async fn sync_with_progress(
                     dropped_count = 0;
                     optional_reason = None;
                 }
+                SyncStatus::Erased => {
+                    status_label = "erased";
+                    dropped_count = 0;
+                    optional_reason = None;
+                }
                 SyncStatus::Unimportable { reason } => {
                     status_label = "unimportable";
                     dropped_count = 0;
@@ -6496,6 +6510,7 @@ async fn sync_with_progress(
                 outcome.status,
                 SyncStatus::Ok
                     | SyncStatus::Fresh
+                    | SyncStatus::Erased
                     | SyncStatus::Empty
                     | SyncStatus::Superseded
                     | SyncStatus::Unimportable { .. }
@@ -6661,6 +6676,7 @@ fn format_sync_line(adapter: &str, outcome: &SessionOutcome, reason: Option<&str
         SyncStatus::Fresh => ("fresh", green()),
         SyncStatus::Empty => ("empty", dim()),
         SyncStatus::Superseded => ("superseded", dim()),
+        SyncStatus::Erased => ("erased", dim()),
         SyncStatus::Unimportable { .. } => ("unimportable", dim()),
     };
     let tag = paint(raw_tag, tag_style);
@@ -7529,7 +7545,7 @@ async fn local_status(
     // a number it cannot stand behind.
     let rowmap = store.open_cached_rowmap(&default_cache_dir()).await;
     let pending_known = rowmap.is_some();
-    let oracle = pond::sessions::RowmapOracle(rowmap);
+    let oracle = with_erased(store, Box::new(pond::sessions::RowmapOracle(rowmap))).await;
     let mut adapters = Vec::new();
     let (resolved, adapters_error) = match loaded.resolve_adapters(None) {
         Ok(resolved) => (resolved, None),
@@ -7572,7 +7588,7 @@ async fn local_status(
             continue;
         };
         let plan = if pending_known {
-            opened.plan(&oracle).await.ok().flatten()
+            opened.plan(oracle.as_ref()).await.ok().flatten()
         } else {
             None
         };

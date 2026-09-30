@@ -160,6 +160,10 @@ impl Adapter for ClaudeAiExportAdapter {
                     });
                     continue;
                 }
+                if let Some(skip) = crate::adapter::erased_skip(oracle, &session_id) {
+                    yield Ok(skip);
+                    continue;
+                }
                 // Skip when the conversation's latest message timestamp is no
                 // newer than pond's watermark. The messages are chronological, so
                 // the last element is the latest; the whole export is already in

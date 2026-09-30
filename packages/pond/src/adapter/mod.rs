@@ -348,19 +348,28 @@ pub trait SkipOracle: Send + Sync {
 
 /// Seam decision rule - the only place the freshness comparison lives. A session
 /// is fresh (skip the re-decode) iff the source's latest message timestamp is no
-/// newer than pond's stored watermark, or the store has erased it - its rows
-/// would be dropped at ingest, so decoding them is waste. A missing signal on
-/// either side is never fresh.
+/// newer than pond's stored watermark. A missing signal on either side is never
+/// fresh.
 pub fn is_session_fresh(
     oracle: &dyn SkipOracle,
     session_id: &str,
     source_last_ts_micros: Option<i64>,
 ) -> bool {
-    oracle.is_erased(session_id)
-        || matches!(
-            (oracle.session_max_ts(session_id), source_last_ts_micros),
-            (Some(stored), Some(source)) if source <= stored
-        )
+    matches!(
+        (oracle.session_max_ts(session_id), source_last_ts_micros),
+        (Some(stored), Some(source)) if source <= stored
+    )
+}
+
+/// The skip an adapter yields, ahead of its freshness gate, for a session the
+/// store has erased: its rows would be dropped at ingest, so decoding them is
+/// waste, and it is reported as erased rather than fresh.
+pub fn erased_skip(oracle: &dyn SkipOracle, session_id: &str) -> Option<AdapterYield> {
+    oracle.is_erased(session_id).then(|| AdapterYield::Skipped {
+        session_id: Some(session_id.to_owned()),
+        project: None,
+        reason: SkipReason::Erased,
+    })
 }
 
 /// Any [`SkipOracle`] plus the store's erased ids - how a sync hands the
@@ -442,6 +451,9 @@ pub enum SkipReason {
     /// supersession is by session id (the source's documented migration
     /// contract). Visible and counted, never folded into `Empty`.
     Superseded,
+    /// The store has erased this session (spec.md#session-append-only-exception),
+    /// so it is skipped undecoded and never syncs again.
+    Erased,
 }
 
 pub type AdapterYieldStream<'a> =
@@ -985,9 +997,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        EdgeFidelity, ErasedOracle, NoopOracle, RestoreFidelity, RestoredFile, SkipOracle,
-        SourceWatermark, SyncPlan, is_session_fresh, registry, validate_path_id,
-        write_restored_files,
+        AdapterYield, EdgeFidelity, ErasedOracle, NoopOracle, RestoreFidelity, RestoredFile,
+        SkipOracle, SkipReason, SourceWatermark, SyncPlan, erased_skip, is_session_fresh, registry,
+        validate_path_id, write_restored_files,
     };
 
     struct Watermarks(std::collections::HashMap<&'static str, i64>);
@@ -1006,13 +1018,20 @@ mod tests {
     }
 
     #[test]
-    fn is_session_fresh_skips_erased_ids_undecoded() {
+    fn an_erased_session_skips_as_erased_not_fresh() {
         let oracle = erased_over(Box::new(Watermarks([("kept", 10)].into())), &["gone"]);
         // No watermark and no source signal: an erased id still skips.
-        assert!(is_session_fresh(&oracle, "gone", None));
+        assert!(matches!(
+            erased_skip(&oracle, "gone"),
+            Some(AdapterYield::Skipped {
+                reason: SkipReason::Erased,
+                ..
+            })
+        ));
+        assert!(!is_session_fresh(&oracle, "gone", None));
+        assert!(erased_skip(&oracle, "kept").is_none());
         assert!(is_session_fresh(&oracle, "kept", Some(10)));
         assert!(!is_session_fresh(&oracle, "kept", Some(11)));
-        assert!(!is_session_fresh(&oracle, "never-seen", Some(1)));
         // The wrapper never makes an empty oracle look populated.
         assert!(erased_over(Box::new(NoopOracle), &["gone"]).is_empty());
     }

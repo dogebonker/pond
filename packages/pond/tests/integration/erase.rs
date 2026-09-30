@@ -14,7 +14,7 @@ use pond::{
     adapter::{Adapter, ClaudeCodeAdapter, ErasedOracle, NoopOracle},
     embed::{Embedder, LazyEmbedder},
     erase::ErasedIntent,
-    handlers::{ingest_adapter, pond_get_session, pond_search},
+    handlers::{SyncEvent, SyncStatus, ingest_adapter, pond_get_session, pond_search},
     sessions::{IngestSummary, Store},
     substrate::MaintenancePolicy,
     wire::{GetEnvelope, GetSessionRequest, SearchEnvelope, SearchModeWire, SearchRequest, SortBy},
@@ -60,11 +60,25 @@ async fn sync_never_imports_an_erased_session_and_the_plan_counts_it() -> anyhow
 
     let store = Store::open_local(temp.path().join("store")).await?;
     store.import_erase_intent(&intent(&erased)).await?;
-    let summary = sync_fixtures(&store).await?;
+    let mut reported_erased = Vec::new();
+    let summary = ingest_adapter(
+        &store,
+        &ClaudeCodeAdapter::new(FIXTURES),
+        &NoopOracle,
+        |event| {
+            if let SyncEvent::SessionDone(outcome) = event
+                && matches!(outcome.status, SyncStatus::Erased)
+            {
+                reported_erased.extend(outcome.session_id);
+            }
+        },
+    )
+    .await?;
     assert!(
         summary.denylisted > 0,
         "the erased source was read and withheld"
     );
+    assert_eq!(reported_erased, vec![erased.clone()], "withheld, not ok");
     let stored = store.session_ids().await?;
     assert!(!stored.contains(&erased), "nothing resurrected");
     assert_eq!(stored.len(), ids.len() - 1);
@@ -85,6 +99,7 @@ async fn sync_never_imports_an_erased_session_and_the_plan_counts_it() -> anyhow
     // A second sync through that oracle still imports nothing of it.
     let again = ingest_adapter(&store, &ClaudeCodeAdapter::new(FIXTURES), &oracle, |_| {}).await?;
     assert_eq!(again.inserted, 0);
+    assert_eq!(again.skipped_erased, 1, "reported as erased, not fresh");
     assert!(!store.session_ids().await?.contains(&erased));
     Ok(())
 }

@@ -247,6 +247,10 @@ impl Adapter for ClaudeDesktopAppAdapter {
             // when the oracle has entries - a first ingest has nothing to compare.
             let mut survivors = Vec::with_capacity(files.len());
             for file in files {
+                if let Some(skip) = crate::adapter::erased_skip(oracle, &file.session_id) {
+                    yield Ok(skip);
+                    continue;
+                }
                 if !oracle.is_empty() {
                     let audit = file.audit_path.clone();
                     let last_ts =

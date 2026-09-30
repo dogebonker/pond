@@ -241,6 +241,10 @@ impl Adapter for AgyAdapter {
             let mut survivors = Vec::with_capacity(heads.conversations.len());
             let mut fresh = 0usize;
             for (conversation, watermark) in heads.conversations {
+                if let Some(skip) = crate::adapter::erased_skip(oracle, &conversation.id) {
+                    yield Ok(skip);
+                    continue;
+                }
                 if watermark.is_some_and(|mark| source_in_sync(oracle, Some(&conversation.id), mark)) {
                     fresh += 1;
                     continue;

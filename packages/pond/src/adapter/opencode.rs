@@ -233,6 +233,10 @@ impl Adapter for OpencodeAdapter {
 
             let mut survivors = Vec::with_capacity(entries.len());
             for entry in entries {
+                if let Some(skip) = crate::adapter::erased_skip(oracle, entry.source.session_id()) {
+                    yield Ok(skip);
+                    continue;
+                }
                 if crate::adapter::is_session_fresh(oracle, entry.source.session_id(), entry.source_ts) {
                     yield Ok(AdapterYield::Skipped {
                         session_id: Some(entry.source.session_id().to_owned()),
