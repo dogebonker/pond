@@ -13,7 +13,7 @@ pond ingests, stores, searches, and restores agentic-client sessions. This docum
 
 ### 1.1 What pond is
 
-pond ingests agentic-client sessions (Claude Code, Codex, others) into one canonical form in Lance and serves message-granular search (full-text or semantic, one arm per query; Section 8.7). One static binary serves HTTP+JSON and MCP over shared handlers, in two deployments (Section 2.2).
+pond ingests agentic-client sessions (Claude Code, Codex, others) into one canonical form in Lance and serves message-granular search (full-text, plus semantic when enabled, Section 8.7; one arm per query, Section 8.1). One static binary serves HTTP+JSON and MCP over shared handlers, in two deployments (Section 2.2).
 
 ### 1.2 The interchange-hub model
 
@@ -84,7 +84,7 @@ Stable positions, not deferrals (Section 9). pond will not:
 - **Authenticate, authorize, or model identity or tenancy** - the integrator gates namespaces before any call; `namespace` is an opaque routing string; on hosted deployments bucket IAM is the storage boundary and the integrator's gateway the application boundary.
 - **Encrypt at the application layer** - bucket SSE plus filesystem encryption; pond holds no keys and is not zero-knowledge (bucket-plus-key access reads everything).
 - **Act as a runtime** - no tool execution, agent loop, context compaction, rendering, or telemetry.
-- **Become a SQL database, UI, or sidecar daemon** - search and filter (Section 8) is the primary query surface; one read-only SQL escape hatch exists (`protocol-sql-read-only`, Section 7.5), never a write path or a second storage engine; no UI, no daemon beyond `pond serve`.
+- **Become a SQL database, UI, or sidecar daemon** - search and filter (Section 8) is the primary query surface; one read-only SQL escape hatch exists (`protocol-sql-read-only`, Section 7.5), never a write path or a second storage engine (the only engine is embedded Lance); no UI, no daemon beyond `pond serve`.
 
 ### 2.4 Platform
 
@@ -140,7 +140,7 @@ Local-filesystem writes MUST be durable before returning - bytes plus parent dir
 
 #### `local-store-self-heal`
 
-On a failed local open the substrate MUST self-heal first: pick the newest `_versions/` entry whose manifest loads AND all-column scan completes (crashes can zero referenced data; added columns sit in files narrow scans skip); rename unreadable manifests above it to `<name>.manifest.corrupt` (atomic, same directory, never delete); retry once; loudly name the quarantined files, the rolled-back version, and that rolled-back rows re-ingest from sources still holding them (`session-movement-complete`; rotated sources cannot, `session-durable-copy`). If nothing is readable or the failure is not manifest-shaped, heal MUST touch nothing and return the original error plus what was inspected and the recovery step. Why on open: the damage is a crash remnant and every surface (CLI, HTTP, MCP) opens here, so heal needs no human.
+On a failed local open the substrate MUST self-heal first: pick the newest `_versions/` entry whose manifest loads AND all-column scan completes (crashes can zero referenced data; added columns sit in files narrow scans skip); rename unreadable manifests above it to `<name>.manifest.corrupt` (atomic, same directory, never delete); retry once; loudly name the quarantined files, the rolled-back version, and that rolled-back rows re-ingest from sources still holding them (`session-movement-complete`; rotated sources cannot, `session-durable-copy`). If nothing is readable or the failure is not manifest-shaped, heal MUST touch nothing and return the original error plus what was inspected and the recovery step. Why on open: the damage is a crash remnant and every surface (CLI, HTTP, MCP) opens here, so heal needs no human; heal restores openability and keeps the evidence, while recovering the rolled-back rows depends on their sources.
 
 ### 3.4 Dataset parameters
 
@@ -171,12 +171,13 @@ An unenforced PK. Why: merge-insert defaults to it without per-call wiring, and 
 Automatic compaction runs only Lance-planned tasks that pass:
 
 1. Tasks above the deletion-materialization threshold always run (tombstone reclaim pays regardless).
-2. Others MUST strictly cut fragment count under BOTH writer caps - byte budget (rounded up) and row target (LIVE rows, floor of one); past one output's budget, every input's physical row width MUST let an output reach the row target within half the budget.
-3. A task MUST earn its write amplification: the volume beside its largest fragment, and beside its settled fragments' sum (half an output under the binding cap), MUST each reach a fixed fraction of it; an all-settled task uses the largest alone.
-4. Missing file sizes fail closed.
-5. Rewrites re-encode, never binary-copy.
+2. Others MUST strictly cut fragment count under BOTH writer caps - byte budget (outputs = total bytes / budget, rounded up) and row target (outputs = LIVE rows / target, rounded down, at least one); when the task's total bytes exceed one output's budget, every input's physical row width MUST let an output reach the row target within half the budget.
+3. A task MUST earn its write amplification: the volume beside its largest fragment, and the volume beside the sum of its settled fragments (each already holding at least half an output by either cap), MUST each reach a fixed fraction of it; an all-settled task uses the largest alone.
+4. A task spanning at least the fragment-count cap skips the width test of (2) and all of (3) once it can cut the fragment count.
+5. Missing file sizes fail closed.
+6. Rewrites re-encode, never binary-copy.
 
-Why: (2) row-selected input against byte-split output loops forever (~30 GB over 31 syncs; ~80 GiB/day under byte-only prediction); (3) tiny appends must not ride full copies of settled peers (size-tiered amortization); (5) binary copies keep tiny pages whose metadata every take reads (11,300 GETs vs 15). See substrate.rs `task_veto_reason`, docs/benchmarks/results.md.
+Why: (2) row-selected input against byte-split output loops forever (~30 GB over 31 syncs; ~80 GiB/day under byte-only prediction); (3) tiny appends must not ride full copies of settled peers (size-tiered amortization); (4) bounds manifest growth; (6) binary copies keep tiny pages whose metadata every take reads (11,300 GETs vs 15). See substrate.rs `task_veto_reason`, docs/benchmarks/results.md.
 
 ### 3.5 Concurrency
 
@@ -184,7 +185,7 @@ pond processes are stateless; concurrent writers resolve via Lance OCC on manife
 
 #### `lance-retry-jitter`
 
-Every Lance call MUST retry with bounded exponential backoff and jitter. Why: transient faults and lost races are routine. Exception: a non-idempotent batch append MUST retry only on commit conflict (a fault between commit and ack would duplicate rows); other faults surface and the next run re-plans.
+Every Lance call MUST retry with bounded exponential backoff and jitter. Why: transient faults and lost races are routine. Exception: a non-idempotent batch append (no row-level PK dedup) MUST retry only on commit conflict (a fault between commit and ack would duplicate rows); other faults surface and the next run re-plans.
 
 #### `lance-handle-freshness`
 
@@ -264,7 +265,7 @@ Stored canonical is authoritative - not derived, no second "raw" copy. Why: a ra
 
 - Field names and discriminator values are `snake_case`.
 - `SessionID`, `MessageID`, `PartID` are branded string scalars, plain strings on the wire; source-supplied where stable, generated otherwise.
-- Timestamps are RFC 3339 on the wire, microsecond integers in storage; canonical timestamps are source-recorded, pond's ingest time is a separate column.
+- Timestamps are RFC 3339 on the wire, microsecond integers in storage; canonical timestamps are source-recorded, never pond's ingest time.
 - `options` sits on every object: `options.<provider>.*` provider extensions, `options.source.*` source and harness facts, `options.pond.*` pond-operational facts.
 
 ### 4.4 Common types
@@ -397,7 +398,7 @@ Five rules, enforced by the adapter seam (Section 6) or core ingest, not by conv
 
 #### `model-no-synthesis`
 
-An adapter MUST NOT substitute a sentinel, default, or placeholder for source data it could not find; a maybe-absent field is an optional sealed value produced only by the Section 6 extractor helpers, never from a literal in adapter code. Transport or absence defaults are not synthesis (timestamp falling back to the session anchor, failure flag false, generic MIME type). Why: a synthesized value is indistinguishable from a real one downstream, and only a compile error enforces that.
+An adapter MUST NOT substitute a sentinel, default, or placeholder for source data it could not find; a maybe-absent field is an optional sealed value produced only by the Section 6 extractor helpers, never from a literal in adapter code. Transport or absence defaults are not synthesis (timestamp falling back to the session anchor, failure flag false, generic MIME type). Why: a synthesized value is indistinguishable downstream from a real one (silent corruption), and only a compile error, not code review, reliably prevents it.
 
 #### `model-schema-honesty`
 
@@ -486,13 +487,13 @@ Storage MUST be the union of every still-reachable source - the completeness com
 - Datasets commit non-atomically (`lance-forward-compat-no-cross-shard-atomic-write`), so any "already ingested" signal MUST derive from stored data, never a pre-durability marker; a partial flush then re-ingests instead of latching "done".
 - The signal MUST stay cheap on every backend, bounded by data scanned, not stored history.
 - `pond copy` always ends with a composite-PK verify (exit 6 on a missing row or destination duplicate).
-- The skip MAY pass a source a bounded whole-source inspection proves holds nothing ingestible; the proof MUST be re-derived from current content every run, never cached, and an unclassifiable source MUST be re-read.
+- The freshness skip MAY also skip a source that a bounded whole-source inspection proves holds nothing ingestible; the proof MUST be re-derived from current content every run, never cached, and an unclassifiable source MUST be re-read.
 
 Why: monotone-but-incomplete is still silent loss - a skip outrunning durability, or an unverified delta, drops data while reporting success.
 
 #### `session-append-only-exception`
 
-Erasing a whole session is the single exception to append-only and pond's only deletion; within a session no stored Message or Part is ever mutated, reordered, or removed. It is operator-only (`pond erase <session-id>`, CLI and HTTP, never MCP), cascades to child sessions (mirroring `adapter-lineage-complete-restore`), and is a true byte purge - delete, compaction, version-history cleanup, blob purge - so time-travel keeps nothing. Erased keys enter an ingest denylist so still-present sources cannot resurrect them - the subtraction term keeping `session-movement-complete` sound. It names what it erased and what the denylist blocks. Why: right-to-erasure needs deletion without resurrection or retained bytes; one operator-only exception leaves `session-durable-copy` and `adapter-integrity-additive-sync` intact.
+Specified, not yet implemented: until `pond erase` ships, pond performs no deletion. Erasing a whole session is the single exception to append-only and pond's only deletion; within a session no stored Message or Part is ever mutated, reordered, or removed. It is operator-only (`pond erase <session-id>`, CLI and HTTP, never MCP), cascades to child sessions (mirroring `adapter-lineage-complete-restore`), and is a true byte purge - delete, compaction, version-history cleanup, blob purge - so time-travel keeps nothing. Erased keys enter an ingest denylist so still-present sources cannot resurrect them - the subtraction term keeping `session-movement-complete` sound. It names what it erased and what the denylist blocks. Why: right-to-erasure needs deletion without resurrection or retained bytes; one operator-only exception leaves `session-durable-copy` and `adapter-integrity-additive-sync` intact.
 
 ### 5.5 Embeddings are derived
 
@@ -598,7 +599,7 @@ One registry; a new adapter is a new file plus one line there - no central enum,
 
 ### 6.8 Conformance
 
-Each adapter's round-trip test (fixture to canonical to native, value-equal) enforces `adapter-native-restore-lossless` and exercises `model-lossless-projection`; the shared harness (`packages/pond/tests/integration/adapter/mod.rs`) proves the canonical fixed point or names the test owning value-equality. Foreign output is checked for target-format validity against a golden file.
+Each adapter's round-trip test (fixture to canonical to native, value-equal) enforces `adapter-native-restore-lossless` and exercises `model-lossless-projection`; the shared harness (`packages/pond/tests/integration/adapter/mod.rs`) proves the canonical fixed point, or, where native output targets an external import tool, names the test owning value-equality. Foreign output is tested for target-format validity and reviewed against a golden file.
 
 ### 6.9 Adapter set
 
@@ -649,8 +650,8 @@ Retryability is conveyed by the code alone; `conflict` maps the substrate confli
 ### 7.5 Operations
 
 1. **`pond_search`** (`POST /v1/search`) - one arm (`mode`: `fts` default, or `vector`; Section 8); hits grouped by session; `format` `text` (default) or `json`.
-2. **`pond_get_session`** (`POST /v1/get-session`) - a session's conversational view (text plus `parts_summary`). `id` is a session id, or a message id upcast to a containing session, page anchored there; a message replayed into several sessions (`lance-table-creation-session-scoped-pk`) resolves to an undefined one of them, named with `resolved_from_message_id` - read by session id to pick a copy. `from` is `start` or `end`; pages are bounded by `limit` and a size budget, never cut mid-message. Not for bulk export.
-3. **`pond_get_message`** (`POST /v1/get-message`) - the target's full Parts, any role (budget-bounded; `target_parts_remaining` signals the cut), plus conversational siblings. A session id is rejected with a hint naming `pond_get_session` (only message-to-session is well-defined).
+2. **`pond_get_session`** (`POST /v1/get-session`) - a session's conversational view (text plus `parts_summary`). `id` is a session id, or a message id upcast to a containing session, page anchored there and `resolved_from_message_id` flagging the upcast (safe because the operation states the intent); a message replayed into several sessions (`lance-table-creation-session-scoped-pk`) resolves to an unspecified one of them, named by the response's `session` - read by session id to pick a copy. `from` is `start` or `end`; pages are bounded by `limit` and a size budget, never cut mid-message. Not for bulk export.
+3. **`pond_get_message`** (`POST /v1/get-message`) - the target's full Parts, any role (budget-bounded; `target_parts_remaining` signals the cut), plus conversational siblings (so system/tool carriers cannot crowd the window). A session id is rejected with a hint naming `pond_get_session` (only message-to-session is well-defined).
 4. **`pond_ingest`** (`POST /v1/ingest`) - batches capped by event count and bytes, applied per session, partial success per row.
 5. **`pond_sql`** (`POST /v1/x/sql`) - one query per `protocol-sql-read-only`, rejected before any dataset opens; capped JSON rows, cut signalled; experimental because its columns follow the storage schema; no tenant scoping yet.
 
@@ -658,7 +659,7 @@ Resources: `schema://pond`, `schema://pond-sql`, `stats://pond` (search fields, 
 
 #### `protocol-sql-read-only`
 
-Every SQL surface (MCP tool, `pond sql`, `/v1/x/sql`) MUST be read-only in two layers: a pre-parse gate admitting exactly one SELECT/WITH, then DataFusion with DDL, DML, and statements disallowed (a bare `EXPLAIN` of a SELECT excepted); fresh context per query. Why: engine options alone miss `EXPLAIN ANALYZE` and `DESCRIBE`.
+Every SQL surface (MCP tool, `pond sql`, `/v1/x/sql`) MUST be read-only in two layers: a pre-parse gate admitting exactly one query (SELECT, WITH, or a set operation) or an `EXPLAIN [ANALYZE]` of one, rejecting EXPLAIN of anything else; then DataFusion with DDL and DML disallowed and statements allowed only for an EXPLAIN (whose inner query the gate vetted); fresh context per query. Why: engine options alone miss multi-statement input, `DESCRIBE` / `SET` / `SHOW` / `COPY`, and EXPLAIN of a write.
 
 ### 7.6 Ingest events
 
@@ -666,7 +667,7 @@ An event is one Session, Message, or Part tagged with its kind, ordered per `ada
 
 #### `wire-ingest-relabel`
 
-`source_agent` and `project` are immutable after first write (denormalized, 5.3): a re-submission with a different value MUST keep the STORED labels, and the disagreement MUST be counted (`relabeled_sessions`) and logged, never silent, never a per-row error. Why not reject: the stored value is already safe, so rejecting only discards new messages - permanent loss on exactly the hosts running a corrected adapter. Stale labels still mis-attribute (`model-project-non-empty`; 8.3); fixing one is an undefined migration (`adapter-integrity-additive-sync`), never `pond erase`, whose denylist (`session-append-only-exception`) blocks the re-sync.
+`source_agent` and `project` are immutable after first write (denormalized, 5.3): a re-submission with a different value MUST keep the STORED labels, its rows written under them, and the disagreement MUST be counted (`relabeled_sessions`) and logged, never silent, never a per-row error. Why not reject: the stored value is already safe, so rejecting only discards new messages - permanent loss on exactly the hosts running a corrected adapter. Stale labels still mis-attribute (`model-project-non-empty`; 8.3); fixing one is an undefined migration (`adapter-integrity-additive-sync`), never `pond erase`, whose denylist (`session-append-only-exception`) blocks the re-sync.
 
 ### 7.7 MCP surface
 
@@ -678,7 +679,7 @@ Instructions and tool descriptions MUST offer only the serving instance's capabi
 
 #### `mcp-read-only-heal-exception`
 
-The MCP surface MUST expose no write operation. The substrate's open path MAY write on any surface, MCP included: `local-store-self-heal` quarantine renames and `session-additive-schema-backfill`. Both are open-triggered maintenance, never user-data writes, and MUST NOT be read as precedent for MCP write paths. Why: all surfaces share one open path; forbidding them would brick MCP on a crash-damaged store.
+The MCP surface MUST expose no write operation. The substrate's open path MAY write on any surface, MCP included: creating the empty tables of a fresh store, `local-store-self-heal` quarantine renames, and `session-additive-schema-backfill`. All three are open-triggered maintenance, never user-data writes, and MUST NOT be read as precedent for MCP write paths. Why: all surfaces share one open path; forbidding them would brick MCP on a fresh, crash-damaged, or older-schema store.
 
 ### 7.8 CLI verbs
 
@@ -686,30 +687,30 @@ Global selectors: `--storage-path` / `POND_STORAGE_PATH`, `--config-file` / `PON
 
 #### `cli-json-summary`
 
-With `--format json` a verb MUST print one summary document on stdout per outcome (ok, skipped, error), progress on stderr. Documents evolve additively (keys never change meaning or vanish); an uncomputed count is null, never guessed. Serde types and integration tests pin shapes.
+With `--format json` a verb MUST print one summary document on stdout per outcome (ok, skipped, error), progress on stderr. Documents evolve additively: new keys may appear and are omitted when empty, and within a major version an existing key never changes meaning or vanishes; an uncomputed count is null, never guessed. Serde types and integration tests pin shapes.
 
 | Verb | Contract | Rules |
 |---|---|---|
 | `init` | Setup wizard | `cli-init` |
 | `sync [<adapter>]` | Ingest, fold | `cli-sync` |
 | `optimize` | Embed, fold, diagnose | `cli-optimize` |
-| `adapters list\|discover\|enable\|disable` | Sole writer of `[adapters.*]` (enabling is explicit); `discover` never overwrites an entry naming a `path`; a `path` array fans out to single-path passes (adapters see a scalar); a malformed array fails the whole resolve | `lance-deterministic-pk` |
+| `adapters list\|discover\|enable\|disable` | Manages `[adapters.*]` (with `init` and `serve --bootstrap` the only writers; enabling is always explicit); `discover` never overwrites an entry naming a `path`; a `path` array fans out to single-path passes (adapters see a scalar); a malformed array fails the whole resolve, naming the unaffected adapters and the scoped `pond sync <adapter>` that still works | `lance-deterministic-pk`, `cli-sync` |
 | `search`, `get-session`, `get-message` | The read operations; `search --explain` shows the plan | 7.5 |
 | `sql` | One SELECT/WITH, inline or parquet/ndjson | `protocol-sql-read-only` |
-| `status` | Counts, index health, schedule, host view (pending from the local cache, never remote); `--hosts` fleet | `model-pond-options` |
+| `status` | Counts, index health, schedule, host view (pending from the local cache, never remote); `--hosts` fleet | `model-pond-options` (`--hosts`), `cli-optimize` (read-only diagnosis) |
 | `serve`, `mcp` | HTTP or stdio MCP | `cli-serve` |
 | `schedule start\|stop\|status\|logs` | Scheduler registration | `cli-schedule` |
 | `config show\|path\|schema` | Redacted resolved config with per-field source | `storage-redaction` |
 | `storage check\|use <URL>` | End-to-end probe (exit code per failure class); `use` then switches | `cli-storage-use` |
 | `creds add\|list\|delete` | `[creds.*]` sets, secrets redacted | `creds-scope-match` |
 | `copy` | Move data | `cli-copy` |
-| `erase <id>` | Operator-only purge plus denylist; never MCP | `session-append-only-exception` |
+| `erase <id>` | Pending (not yet implemented): operator-only purge plus denylist; never MCP | `session-append-only-exception` |
 | `resume <id> --to <adapter>` | Restore | `cli-resume` |
 | `completions`, `skill` | Shell completions; SKILL.md from the binary | - |
 
 #### `cli-sync`
 
-Ingests enabled `[adapters.*]`, then folds indexes and compacts, amortizing the round-trip-bound version-cleanup walk over several runs (`pond optimize` and `pond copy` clean every run). MUST NOT discover, enable, or write adapter state (unattended runs never grow the set); `--path` is a one-off override that never writes config. Source trouble is per-adapter under stable reason tokens (missing path fails the adapter; lossy runs degraded, losses counted) and the run exits 0 - but a named adapter errors hard and a malformed config fails the resolve. Single-flight per host and store via a state-dir flock, never on the store (cross-host stays pure OCC); `--no-wait` skips. `--dry-run` writes no session data; runs record per-host freshness and last-sync state for `pond status`.
+Ingests enabled `[adapters.*]`, then folds indexes and compacts, amortizing the round-trip-bound version-cleanup walk over several runs (`pond optimize` and `pond copy` clean every run). MUST NOT discover, enable, or write adapter state (unattended runs never grow the set); `--path` is a one-off override that never writes config. Source trouble is per-adapter under stable reason tokens (missing path fails the adapter; lossy runs degraded, losses counted) and the run exits 0 (`session-movement-complete`: other sources stay reachable, and a shared fleet config legitimately enables adapters for tools a host lacks) - but a named adapter errors hard and a malformed config fails the resolve. Single-flight per host and store via a state-dir flock, never on the store (cross-host stays pure OCC): a second sync waits, naming the holder; `--no-wait` skips with exit 0. `--dry-run` writes no session data, but may create an empty store at a new destination and build the local freshness cache; runs record per-host freshness and last-sync state for `pond status`.
 
 #### `cli-optimize`
 
@@ -717,15 +718,15 @@ Embed stage (backlog), then index stage (fold, compaction, cleanup every run); `
 
 #### `cli-init`
 
-Idempotent wizard (storage probe, adapters, MCP, opt-in schedule) writing config once, at the end; every section is flag-answerable, and `--yes` alone never schedules. MCP consent installs the bundled skill; a hand-edited copy MUST NOT be overwritten unconfirmed. The schedule registers only after the offered first sync completes or is interrupted.
+Idempotent wizard (storage probe, adapters, MCP, opt-in schedule) writing config once, at the end; every section is flag-answerable, and `--yes` alone never schedules. MCP consent installs the bundled skill; a hand-edited copy MUST NOT be overwritten unconfirmed. An opted-in schedule registers after the first sync when init runs one - on success, failure, or Ctrl-C - and immediately otherwise. Why: a fresh systemd timer fires on registration and would race the long first sync.
 
 #### `cli-serve`
 
-`/mcp` MUST check `Host` against a loopback-only default allowlist (DNS-rebinding defence; `--allowed-host` widens); `/v1/x/sql` shares the gate. `--with-sync` runs the interval sync in-process after bind - topology only, not live-write: same sync, lock (`--no-wait`), and records, stdout left to the transport, a failed cycle never stopping serving. `--bootstrap <adapter>` (operator opt-in) enables it only when no `[adapters.*]` entry exists (disabled counts), before the sync loop starts. Unix `--socket` is owner-only 0600 (permissions are the access control), with an exclusive sidecar lock keeping a second server off the path.
+`/mcp` MUST check `Host` against a loopback-only default allowlist (DNS-rebinding defence; `--allowed-host` widens); `/v1/x/sql` shares the gate because it reads arbitrary corpus rows; the other `/v1/*` routes, `/v1/ingest` included, are not gated. `--with-sync` runs the interval sync in-process after bind - topology only, not live-write: same sync, lock (`--no-wait`), and records, stdout left to the transport, a failed cycle never stopping serving. `--bootstrap <adapter>` (operator opt-in) enables it only when no `[adapters.*]` entry exists (disabled counts), before the sync loop starts; a discovery failure is a logged warning naming `pond init`, and serve still starts. Unix `--socket` is owner-only 0600 (permissions are the access control), with an exclusive sidecar lock keeping a second server off the path.
 
 #### `cli-schedule`
 
-Registers `pond sync -q --no-wait` with launchd, systemd timers (or crontab), or Task Scheduler (via windowless `pondw.exe`). Registration MUST pin the resolved state dir and config file into the job (on Windows by `--state-dir` argument, `Exec` having no environment), warning when `XDG_STATE_HOME` is set interactively. Why: schedulers never source shell rc files, so an unpinned override splits lock, state, or configuration between scheduled and manual runs.
+Registers `pond sync -q --no-wait` with launchd, systemd timers (or crontab), or Task Scheduler (via windowless `pondw.exe`). Registration MUST pin the resolved state dir and config file into the job (on Windows by `--state-dir` and `--config-file` arguments, `Exec` having no environment), warning when `XDG_STATE_HOME` is set interactively. Why: schedulers never source shell rc files, so an unpinned override splits lock, state, or configuration between scheduled and manual runs.
 
 #### `cli-copy`
 
@@ -733,7 +734,7 @@ Moves canonical data between stores, `.pond` archives, and JSONL (export-only), 
 
 #### `cli-resume`
 
-Restores a session with its children or not at all (`adapter-lineage-complete-restore`) at system-decided, per-session-reported fidelity (6.3). MUST NOT overwrite or delete: a preflight fails the whole operation before the first byte, naming every collision. Exit codes separate not stored, unanswerable, collision, and failed write; a failed write unwinds what it created, best-effort. CLI only in v1, never MCP; HTTP deferred.
+Restores a session with its children or not at all (`adapter-lineage-complete-restore`) at system-decided, per-session-reported fidelity (6.3). MUST NOT overwrite or delete: a preflight fails the whole operation before the first byte, naming every collision. Why: the destination is a live client's data directory, which is what makes a collision mean "already resumed - open the file you have". Exit codes separate not stored, unanswerable, collision, and failed write; a failed write unwinds what it created, best-effort. Operator-only: CLI in v1, never MCP; HTTP deferred.
 
 #### `cli-storage-use`
 

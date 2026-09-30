@@ -5610,8 +5610,8 @@ pub fn init_embedding_dim(dim: usize) {
 }
 
 /// Initial-`CREATE` write params for the namespace-mediated path
-/// (spec.md#lance-table-creation: stable row ids on). The
-/// substrate seam stamps in `session`, `mode`, and `store_params`.
+/// (spec.md#lance-table-creation-stable-row-ids).
+/// The substrate seam stamps in `session`, `mode`, and `store_params`.
 /// `auto_cleanup` is short; long-term recovery is `pond copy --to <file>`
 /// snapshots plus deferred Lance tags (spec.md#session-durable-copy).
 /// `skip_auto_cleanup` suppresses the per-commit hook so cleanup stays

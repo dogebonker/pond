@@ -1,76 +1,96 @@
 #!/usr/bin/env bash
-# Gate cross-references between docs/spec.md and the Rust source. Rule ids are
-# declared as `#### `rule-id`` headings; a prose citation or a `spec.md#anchor`
-# in code that names a truncated, misspelled or removed id otherwise rots
-# silently. Checks: duplicate declarations, unresolved in-spec references,
-# unresolved code references.
+# Rule ids in docs/spec.md rot silently when code or prose cites them by a
+# truncated, misspelled or removed name; this fails the build on any reference
+# that no longer resolves.
 set -euo pipefail
 
+cd "$(git rev-parse --show-toplevel)"
+
 spec="${1:-docs/spec.md}"
-code_roots=(packages/pond/src packages/pond/tests packages/pond/SKILL.md)
+code_roots=(packages/pond/src packages/pond/tests packages/pond/benches packages/pond/SKILL.md)
 
-id='[a-z][a-z0-9]*(-[a-z0-9]+)+'
-ref="(lance|local-store|storage|creds|model|session|adapter|wire|protocol|mcp|search|cli)-[a-z0-9]+(-[a-z0-9]+)*"
+awk -v spec="$spec" '
+function firstseg(s) { return substr(s, 1, index(s, "-") - 1) }
+function fail(msg) { print msg > "/dev/stderr"; bad = 1 }
 
-# Legacy free-form anchors that are neither a rule id nor a heading word. New
-# entries are not allowed here: add a matching heading or rule id instead.
-legacy_anchors=(
-)
+BEGIN { nd = nt = nh = nc = nspec = 0 }
 
-bad=0
-fail() { echo "$1" >&2; bad=1; }
+FNR == 1 { fileno++ }
 
-declared=$(grep -nE "^#{3,6} +\`$id\`" "$spec" | sed -E "s/^([0-9]+):#+ +\`($id)\`.*/\1 \2/" || true)
-declared_ids=$(awk '{print $2}' <<< "$declared" | sort -u)
-n_declared=$(awk 'NF' <<< "$declared_ids" | wc -l | tr -d ' ')
+fileno == 1 {
+  hl = match($0, /^#+/) ? RLENGTH : 0
+  m = substr($0, hl + 1)
+  if (hl >= 3 && hl <= 6 && match(m, /^ +`[a-z][a-z0-9]*(-[a-z0-9]+)+`/)) {
+    match(m, /`[^`]+`/)
+    id = substr(m, RSTART + 1, RLENGTH - 2)
+    if (!(id in lines)) order[nd++] = id
+    lines[id] = lines[id] (lines[id] == "" ? "" : ",") FNR
+    next
+  }
+  if ($0 ~ /^#/) headings[nh++] = tolower($0)
+  s = $0
+  while (match(s, /`[a-z][a-z0-9]*(-[a-z0-9]+)+`/)) {
+    tokline[nt] = FNR
+    tok[nt++] = substr(s, RSTART + 1, RLENGTH - 2)
+    s = substr(s, RSTART + RLENGTH)
+  }
+  next
+}
 
-while read -r dup; do
-  [ -n "$dup" ] || continue
-  lines=$(awk -v d="$dup" '$2==d{printf "%s%s", s, $1; s=","}' <<< "$declared")
-  fail "$spec:${lines%%,*}: duplicate rule-id declaration \`$dup\` (lines $lines)"
-done < <(awk '{print $2}' <<< "$declared" | sort | uniq -d)
+{
+  n = split($0, p, ":")
+  cfile[nc] = p[1]; cline[nc] = p[2]; canchor[nc++] = p[3]
+}
 
-is_declared() { grep -qxF -- "$1" <<< "$declared_ids"; }
+END {
+  if (nd == 0) {
+    print "check-spec-refs: no rule ids declared in " spec " (`####` headings)" > "/dev/stderr"
+    exit 1
+  }
+  for (i = 0; i < nd; i++) {
+    id = order[i]
+    pre[firstseg(id)] = 1
+    t = substr(id, index(id, "-") + 1)
+    if (!(t in tails) || id < tails[t]) tails[t] = id
+    if (index(lines[id], ",")) {
+      first = lines[id]; sub(/,.*/, "", first)
+      fail(spec ":" first ": duplicate rule-id declaration `" id "` (lines " lines[id] ")")
+    }
+  }
 
-n_spec_refs=0
-while IFS=: read -r line tok; do
-  [ -n "$line" ] || continue
-  n_spec_refs=$((n_spec_refs + 1))
-  tok=${tok//\`/}
-  is_declared "$tok" || fail "$spec:$line: unresolved rule-id reference \`$tok\`"
-done < <(grep -noE "\`$ref\`" "$spec" || true)
+  for (i = 0; i < nt; i++) {
+    t = tok[i]
+    if (firstseg(t) in pre) {
+      nspec++
+      if (!(t in lines)) fail(spec ":" tokline[i] ": unresolved rule-id reference `" t "`")
+    } else if (t in tails) {
+      fail(spec ":" tokline[i] ": truncated rule-id reference `" t "` (did you mean `" tails[t] "`?)")
+    }
+  }
 
-# A token without a topic prefix that is the tail of a declared id is a
-# truncated citation (the prefix was dropped), not a free-standing word.
-while IFS=: read -r line tok; do
-  [ -n "$line" ] || continue
-  tok=${tok//\`/}
-  full=$(grep -E -- "-$tok\$" <<< "$declared_ids" | head -n1 || true)
-  [ -z "$full" ] || fail "$spec:$line: truncated rule-id reference \`$tok\` (did you mean \`$full\`?)"
-done < <(grep -noE "\`$id\`" "$spec" || true)
+  for (i = 0; i < nc; i++) {
+    a = canchor[i]; sub(/^spec\.md#/, "", a); sub(/[.-]+$/, "", a)
+    where = cfile[i] ":" cline[i]
+    if (a ~ /^[a-z][a-z0-9]*(-[a-z0-9]+)+$/ && (firstseg(a) in pre)) {
+      if (!(a in lines)) fail(where ": spec.md#" a " is not a declared rule id")
+    } else if (a in tails) {
+      fail(where ": spec.md#" a " is a truncated rule id (did you mean `" tails[a] "`?)")
+    } else {
+      if (!(a in seen)) {
+        pat = tolower(a); gsub(/\./, "[.]", pat); gsub(/-/, "[- ]", pat)
+        re = "(^|[^a-z0-9])" pat "([^a-z0-9]|$)"
+        seen[a] = 0
+        for (j = 0; j < nh; j++) if (headings[j] ~ re) { seen[a] = 1; break }
+      }
+      if (!seen[a]) fail(where ": spec.md#" a " matches no rule id or heading word")
+    }
+  }
 
-headings=$(grep -E '^#' "$spec" || true)
-
-n_code_refs=0
-while IFS=: read -r file line match; do
-  [ -n "$file" ] || continue
-  n_code_refs=$((n_code_refs + 1))
-  anchor=${match#spec.md#}
-  anchor=$(printf '%s' "$anchor" | sed -E 's/[.-]+$//')
-  if [[ "$anchor" =~ ^$ref$ ]]; then
-    is_declared "$anchor" || fail "$file:$line: spec.md#$anchor is not a declared rule id"
-    continue
-  fi
-  pat=$(printf '%s' "$anchor" | sed -E 's/[.]/\\./g; s/-/[- ]/g')
-  grep -qiE "(^|[^A-Za-z0-9])$pat([^A-Za-z0-9]|$)" <<< "$headings" && continue
-  for a in ${legacy_anchors[@]+"${legacy_anchors[@]}"}; do [ "$a" = "$anchor" ] && continue 2; done
-  fail "$file:$line: spec.md#$anchor matches no rule id or heading word"
-done < <(grep -rnoE --exclude-dir=fixtures 'spec\.md#[A-Za-z0-9._-]+' "${code_roots[@]}" | sort -t: -k1,1 -k2,2n || true)
-
-if [ "$bad" -ne 0 ]; then
-  echo >&2
-  echo "check-spec-refs: fix the reference, or declare the id as a \`####\` heading in $spec." >&2
-  exit 1
-fi
-
-echo "check-spec-refs: ok ($n_declared declared ids, $n_spec_refs spec refs, $n_code_refs code refs)"
+  if (bad) {
+    print "" > "/dev/stderr"
+    print "check-spec-refs: fix the reference, or declare the id as a `####` heading in " spec "." > "/dev/stderr"
+    exit 1
+  }
+  print "check-spec-refs: ok (" nd " declared ids, " nspec " spec refs, " nc " code refs)"
+}
+' "$spec" <(grep -rnoE --exclude-dir=fixtures 'spec\.md#[A-Za-z0-9._-]+' "${code_roots[@]}" | sort -t: -k1,1 -k2,2n || true)

@@ -1,6 +1,6 @@
 //! Source-adapter seam.
 //!
-//! Pond ingests sessions from many runtimes (spec.md#adapter-transport-agnostic-seam). The seam splits in two:
+//! Pond ingests sessions from many runtimes. The seam splits in two:
 //!
 //! - [`AdapterFactory`] is the stateless face every format publishes once,
 //!   collected by [`registry`]. It knows how to construct configured adapters
