@@ -109,12 +109,13 @@ impl AdapterFactory for OhMyPiFactory {
         NAME
     }
 
-    // A `/tan` fork is branded `oh-my-pi/subagent` like a real spawn, so the brand does not
-    // prove a spawn; continuations have no separate record.
+    // Artifacts-directory children link by path, `/tan` forks among them under the
+    // `oh-my-pi/subagent` brand, so the brand does not prove a spawn. Header `parentSession`
+    // forks are not linked.
     fn lineage_fidelity(&self) -> LineageFidelity {
         LineageFidelity {
             spawns: EdgeFidelity::Complete,
-            continuations: EdgeFidelity::None,
+            continuations: EdgeFidelity::Partial,
             spawn_brand_exact: false,
         }
     }
@@ -921,17 +922,5 @@ mod tests {
             .serialize(&session, RestoreFidelity::Native)
             .expect_err("serialize stays an error, not a panic");
         assert!(error.to_string().contains(reason), "both surfaces agree");
-    }
-
-    #[test]
-    fn declares_its_lineage_fidelity() {
-        assert_eq!(
-            OhMyPiFactory.lineage_fidelity(),
-            LineageFidelity {
-                spawns: EdgeFidelity::Complete,
-                continuations: EdgeFidelity::None,
-                spawn_brand_exact: false,
-            }
-        );
     }
 }

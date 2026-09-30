@@ -102,12 +102,12 @@ impl AdapterFactory for PiCodingAgentFactory {
         NAME
     }
 
-    // Parented children keep the root brand, so no edge ever classifies as a spawn;
-    // continuations link through `parentSessionId`.
+    // pi persists no spawned children. v4 and SQLite forks link through `parentSessionId`, but a
+    // v3 header's path-valued `parentSession` stays unresolved.
     fn lineage_fidelity(&self) -> LineageFidelity {
         LineageFidelity {
             spawns: EdgeFidelity::None,
-            continuations: EdgeFidelity::Complete,
+            continuations: EdgeFidelity::Partial,
             spawn_brand_exact: false,
         }
     }
@@ -2717,17 +2717,5 @@ mod tests {
         }
         std::fs::write(path, jsonl_bytes(NAME, records)?)?;
         Ok(())
-    }
-
-    #[test]
-    fn declares_its_lineage_fidelity() {
-        assert_eq!(
-            PiCodingAgentFactory.lineage_fidelity(),
-            LineageFidelity {
-                spawns: EdgeFidelity::None,
-                continuations: EdgeFidelity::Complete,
-                spawn_brand_exact: false,
-            }
-        );
     }
 }

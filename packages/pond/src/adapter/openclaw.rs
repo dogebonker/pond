@@ -178,10 +178,9 @@ impl AdapterFactory for OpenClawFactory {
         NAME
     }
 
-    // File/archive-era sessions record no spawn edge and DB-era ones only resolve
+    // File/archive-era sessions record no spawn edge and DB-era ones resolve only
     // single-generation keys; compaction successors and checkpoint forks come through the
-    // header path. A spawn whose child key is Main-kind carries the root brand and classifies
-    // as a continuation.
+    // header path.
     fn lineage_fidelity(&self) -> LineageFidelity {
         LineageFidelity {
             spawns: EdgeFidelity::Partial,
@@ -4232,17 +4231,5 @@ mod tests {
             .and_then(Value::as_str);
         assert_eq!(got, temp.path().join(".openclaw").to_str());
         Ok(())
-    }
-
-    #[test]
-    fn declares_its_lineage_fidelity() {
-        assert_eq!(
-            OpenClawFactory.lineage_fidelity(),
-            LineageFidelity {
-                spawns: EdgeFidelity::Partial,
-                continuations: EdgeFidelity::Complete,
-                spawn_brand_exact: true,
-            }
-        );
     }
 }

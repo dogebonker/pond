@@ -1452,16 +1452,4 @@ mod tests {
                 if id == "local-message-1" && content.as_deref().map(String::as_str) == Some("user")
         ));
     }
-
-    #[test]
-    fn declares_its_lineage_fidelity() {
-        assert_eq!(
-            ClaudeDesktopAppFactory.lineage_fidelity(),
-            LineageFidelity {
-                spawns: EdgeFidelity::None,
-                continuations: EdgeFidelity::None,
-                spawn_brand_exact: false,
-            }
-        );
-    }
 }

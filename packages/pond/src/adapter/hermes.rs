@@ -189,13 +189,13 @@ impl AdapterFactory for HermesFactory {
         NAME
     }
 
-    // A missing parent row or `end_reason` degrades a continuation to a spawn branded
-    // `hermes/subagent` (and the cron override brands branch or compaction children
-    // `hermes/cron`), so a spawn brand does not prove a spawn.
+    // Every parent is recorded verbatim, but a missing parent row or `end_reason` degrades a
+    // continuation to a spawn branded `hermes/subagent` (and the cron override brands branch or
+    // compaction children `hermes/cron`), so the brand does not prove a spawn.
     fn lineage_fidelity(&self) -> LineageFidelity {
         LineageFidelity {
             spawns: EdgeFidelity::Complete,
-            continuations: EdgeFidelity::Partial,
+            continuations: EdgeFidelity::Complete,
             spawn_brand_exact: false,
         }
     }
@@ -1679,18 +1679,6 @@ mod tests {
             second.pointer("/row/content").and_then(Value::as_str),
             Some("q"),
             "messages restore in source id order",
-        );
-    }
-
-    #[test]
-    fn declares_its_lineage_fidelity() {
-        assert_eq!(
-            HermesFactory.lineage_fidelity(),
-            LineageFidelity {
-                spawns: EdgeFidelity::Complete,
-                continuations: EdgeFidelity::Partial,
-                spawn_brand_exact: false,
-            }
         );
     }
 }

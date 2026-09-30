@@ -1593,16 +1593,4 @@ mod tests {
         );
         Ok(())
     }
-
-    #[test]
-    fn declares_its_lineage_fidelity() {
-        assert_eq!(
-            CodexCliFactory.lineage_fidelity(),
-            LineageFidelity {
-                spawns: EdgeFidelity::None,
-                continuations: EdgeFidelity::None,
-                spawn_brand_exact: false,
-            }
-        );
-    }
 }

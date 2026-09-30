@@ -69,12 +69,14 @@ impl AdapterFactory for GrokBuildFactory {
         NAME
     }
 
-    // Subagents are branded; continuation recording is unverified, so declared absent.
+    // Forks and worktree sessions carry their parent under the root brand, and subagents link
+    // through the parent-side meta. A `subagent_resume` child is branded `/subagent` but its
+    // parent is the subagent it resumes, so the brand does not prove a spawn.
     fn lineage_fidelity(&self) -> LineageFidelity {
         LineageFidelity {
             spawns: EdgeFidelity::Complete,
-            continuations: EdgeFidelity::None,
-            spawn_brand_exact: true,
+            continuations: EdgeFidelity::Complete,
+            spawn_brand_exact: false,
         }
     }
 
@@ -1379,17 +1381,5 @@ mod tests {
             "every typed message survives"
         );
         Ok(())
-    }
-
-    #[test]
-    fn declares_its_lineage_fidelity() {
-        assert_eq!(
-            GrokBuildFactory.lineage_fidelity(),
-            LineageFidelity {
-                spawns: EdgeFidelity::Complete,
-                continuations: EdgeFidelity::None,
-                spawn_brand_exact: true,
-            }
-        );
     }
 }

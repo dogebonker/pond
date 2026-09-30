@@ -1101,16 +1101,4 @@ mod tests {
         assert_eq!(&*windows.session.project, AGENT_WIN);
         Ok(())
     }
-
-    #[test]
-    fn declares_its_lineage_fidelity() {
-        assert_eq!(
-            LettaCodeFactory.lineage_fidelity(),
-            LineageFidelity {
-                spawns: EdgeFidelity::None,
-                continuations: EdgeFidelity::None,
-                spawn_brand_exact: false,
-            }
-        );
-    }
 }

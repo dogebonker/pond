@@ -104,7 +104,10 @@ impl AdapterFactory for NanoclawFactory {
         NAME
     }
 
-    // Subagents are branded; continuation recording is unverified, so declared absent.
+    // Brand exact: `session_from_rows` gives the parent and the `/subagent` brand together, and
+    // only to `subagents/` sidecars (`subagent_descriptor`), while `opencode::reattribute` brands
+    // only children opencode marks spawned. Top-level transcripts, forks and resumes included,
+    // record no parent.
     fn lineage_fidelity(&self) -> LineageFidelity {
         LineageFidelity {
             spawns: EdgeFidelity::Complete,
@@ -1433,18 +1436,6 @@ mod tests {
             adapter.peek_watermark(&path),
             SourceWatermark::At(expected),
             "walk back past trailing metadata to the last message's timestamp",
-        );
-    }
-
-    #[test]
-    fn declares_its_lineage_fidelity() {
-        assert_eq!(
-            NanoclawFactory.lineage_fidelity(),
-            LineageFidelity {
-                spawns: EdgeFidelity::Complete,
-                continuations: EdgeFidelity::None,
-                spawn_brand_exact: true,
-            }
         );
     }
 }

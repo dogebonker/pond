@@ -132,10 +132,13 @@ pub enum EdgeFidelity {
 
 /// An adapter's lineage declaration (see [`AdapterFactory::lineage_fidelity`]).
 /// `spawns` covers spawned children (sub-agents); `continuations` covers
-/// resumes, forks, branches and compaction successors. `spawn_brand_exact`
+/// resumes, forks, branches and compaction successors. Both state which edges
+/// the adapter records, whatever brand the child carries: a spawn recorded
+/// under the root brand still counts as a recorded spawn. How a recorded
+/// edge's brand classifies it is `spawn_brand_exact`'s concern alone - it
 /// vouches that a child carrying this adapter's `/`-subpath spawn brand is
-/// always a real spawn, never a misbranded continuation - the one property
-/// that lets an edge cascade without an explicit operator flag.
+/// always a real spawn, never a misbranded continuation, the one property that
+/// lets an edge cascade without an explicit operator flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineageFidelity {
     pub spawns: EdgeFidelity,
@@ -982,8 +985,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ErasedOracle, NoopOracle, RestoreFidelity, RestoredFile, SkipOracle, SourceWatermark,
-        SyncPlan, is_session_fresh, validate_path_id, write_restored_files,
+        EdgeFidelity, ErasedOracle, NoopOracle, RestoreFidelity, RestoredFile, SkipOracle,
+        SourceWatermark, SyncPlan, is_session_fresh, registry, validate_path_id,
+        write_restored_files,
     };
 
     struct Watermarks(std::collections::HashMap<&'static str, i64>);
@@ -1036,6 +1040,22 @@ mod tests {
                 erased: 1,
             }
         );
+    }
+
+    /// Brand exactness vouches for recorded spawn edges, so an adapter that
+    /// records none has nothing to vouch for and claiming it is a declaration
+    /// bug that would let unrecorded lineage look cascade-safe.
+    #[test]
+    fn only_an_adapter_that_records_spawns_vouches_for_their_brand() {
+        assert!(!registry().is_empty());
+        for factory in registry() {
+            let fidelity = factory.lineage_fidelity();
+            assert!(
+                !fidelity.spawn_brand_exact || fidelity.spawns != EdgeFidelity::None,
+                "{} vouches for spawns it never records",
+                factory.name(),
+            );
+        }
     }
 
     #[test]

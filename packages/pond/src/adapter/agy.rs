@@ -2635,16 +2635,4 @@ mod tests {
         assert!(run.errors[0].contains("steps/1"), "{}", run.errors[0]);
         assert_eq!(step_messages(session(&run, CLI_NO_WORKSPACE)).len(), 1);
     }
-
-    #[test]
-    fn declares_its_lineage_fidelity() {
-        assert_eq!(
-            AgyFactory.lineage_fidelity(),
-            LineageFidelity {
-                spawns: EdgeFidelity::Complete,
-                continuations: EdgeFidelity::Complete,
-                spawn_brand_exact: true,
-            }
-        );
-    }
 }

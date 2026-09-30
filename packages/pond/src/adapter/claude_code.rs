@@ -2857,16 +2857,4 @@ mod tests {
         );
         Ok(())
     }
-
-    #[test]
-    fn declares_its_lineage_fidelity() {
-        assert_eq!(
-            ClaudeCodeFactory.lineage_fidelity(),
-            LineageFidelity {
-                spawns: EdgeFidelity::Complete,
-                continuations: EdgeFidelity::None,
-                spawn_brand_exact: true,
-            }
-        );
-    }
 }

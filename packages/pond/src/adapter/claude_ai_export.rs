@@ -763,16 +763,4 @@ mod tests {
         assert_eq!(files[0].actual_fidelity, RestoreFidelity::Native);
         Ok(())
     }
-
-    #[test]
-    fn declares_its_lineage_fidelity() {
-        assert_eq!(
-            ClaudeAiExportFactory.lineage_fidelity(),
-            LineageFidelity {
-                spawns: EdgeFidelity::None,
-                continuations: EdgeFidelity::None,
-                spawn_brand_exact: false,
-            }
-        );
-    }
 }

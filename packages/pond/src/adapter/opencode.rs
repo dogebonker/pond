@@ -68,11 +68,11 @@ impl AdapterFactory for OpencodeFactory {
         NAME
     }
 
-    // DB-era children are branded `opencode/<agent>`, tree-era children keep the root brand
-    // (so classify as continuations); continuations are not recorded as a distinct kind.
+    // Only task-spawned children carry `parentID`, recorded in both eras; tree-era ones keep the
+    // root brand, so only DB-era spawns carry the `/`-subpath brand. Forks record no parent.
     fn lineage_fidelity(&self) -> LineageFidelity {
         LineageFidelity {
-            spawns: EdgeFidelity::Partial,
+            spawns: EdgeFidelity::Complete,
             continuations: EdgeFidelity::None,
             spawn_brand_exact: true,
         }
@@ -3280,17 +3280,5 @@ mod tests {
             }),
         )?;
         Ok(())
-    }
-
-    #[test]
-    fn declares_its_lineage_fidelity() {
-        assert_eq!(
-            OpencodeFactory.lineage_fidelity(),
-            LineageFidelity {
-                spawns: EdgeFidelity::Partial,
-                continuations: EdgeFidelity::None,
-                spawn_brand_exact: true,
-            }
-        );
     }
 }
