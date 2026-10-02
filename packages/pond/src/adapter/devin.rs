@@ -14,7 +14,10 @@
 //! and `subagent/chain_node_id` link on the parent's messages), so the
 //! partition ([`group_subagents`]) groups those trees by shape instead: each
 //! child, `<id>/agent-<task prompt message id>`, holds the messages placed in
-//! its trees, and the parent holds the rest - the link included.
+//! its trees, and the parent holds the rest - the link included. The Local
+//! Fusion sidekick is a persistent subagent: every handoff extends one live
+//! tree (marked by its `subagent/handoff` briefs), so it is one child across
+//! all its handoffs.
 //!
 //! The writer deletes nodes on `/revert` and whole sessions on `devin rm`, and
 //! re-saves nodes (same content, new `row_id`) rather than editing them, so
@@ -32,13 +35,13 @@ use tokio::sync::mpsc;
 
 use crate::{
     sessions::{IngestEvent, SessionWithMessages},
-    wire::{Message, Part, PartKind, Provenance, ProviderOptions, Session},
+    wire::{FileData, Message, Part, PartKind, Provenance, ProviderOptions, Session},
 };
 
 use super::{
     Adapter, AdapterError, AdapterErrorKind, AdapterFactory, AdapterYield, AdapterYieldStream,
     DiscoverFuture, Env, PlanFuture, RestoreFidelity, RestoredFile, SkipOracle, SkipReason,
-    SourceWatermark, SyncPlan,
+    SourceWatermark, SyncPlan, compact_json,
     extract::{Extracted, extract_raw_record, extract_str, json_or_string},
     part_id, part_ordinal, source_in_sync, source_options,
     sqlite::{self, CHANNEL_CAP, emit},
@@ -51,6 +54,11 @@ const SUBAGENT_AGENT: &str = "devin/subagent";
 /// `hidden = 1`, which devin's own session lists filter out (migration V15).
 const HELPER_AGENT: &str = "devin/helper";
 const DB_FILE: &str = "sessions.db";
+/// The telemetry operation of the persistent Local Fusion sidekick's system
+/// prefix. devin keys a persistent subagent by a deterministic agent id (the
+/// V17 `subagent_heads` comment), so every tree this prefix roots in one
+/// session is the same agent across all its handoffs.
+const PERSISTENT_PREFIX: &str = "subagent_sidekick";
 
 const RESTORE_UNSUPPORTED: &str = "devin keeps every session as rows in one live SQLite \
      database it rewrites in place (a revert deletes messages), and pond collapses the \
@@ -304,10 +312,11 @@ fn session_rows(conn: &Connection, db: &Path) -> Result<Vec<String>, AdapterErro
 
 /// One session's nodes in `row_id` order, as the columns [`NodeRef::from_row`]
 /// reads followed by `extra`. What the partition needs from `chat_message` is
-/// derived here in SQL (the string `message_id` and `metadata.created_at`, and
-/// the two flags `role` and the telemetry `operation` decide), so the peek
-/// reads no message body; the peek and the read both go through here, so the
-/// two cannot disagree. Malformed JSON yields NULLs, never a failed statement.
+/// derived here in SQL (the string `message_id` and `metadata.created_at`,
+/// and the flags `role`, the telemetry `operation` and the `subagent/handoff`
+/// extension decide), so the peek reads no message body; the peek and the
+/// read both go through here, so the two cannot disagree. Malformed JSON
+/// yields NULLs, never a failed statement.
 fn node_query(extra: &str) -> String {
     format!(
         "SELECT row_id, node_id, parent_node_id, created_at,
@@ -315,8 +324,11 @@ fn node_query(extra: &str) -> String {
              iif(json_type(doc, '$.metadata.created_at') = 'text',
                  doc ->> '$.metadata.created_at', NULL),
              ifnull(doc ->> '$.role' = 'system', 0),
+             ifnull(json_type(doc, '$.metadata.extensions.\"subagent/handoff\"') = 'true', 0),
              parent_node_id IS NULL AND ifnull(doc ->> '$.role' = 'user'
-                 OR doc ->> '$.metadata.telemetry.operation' GLOB 'subagent_*', 0){extra}
+                 OR doc ->> '$.metadata.telemetry.operation' GLOB 'subagent_*', 0),
+             parent_node_id IS NULL AND ifnull(
+                 doc ->> '$.metadata.telemetry.operation' = '{PERSISTENT_PREFIX}', 0){extra}
          FROM (SELECT row_id, node_id, parent_node_id, created_at, metadata, chat_message,
                    iif(json_valid(chat_message), chat_message, NULL) AS doc
                FROM message_nodes WHERE session_id = ?1)
@@ -373,10 +385,14 @@ struct NodeRef {
     message_id: String,
     created_at: Option<String>,
     is_system: bool,
+    /// Carries `subagent/handoff`: a copy of a persistent subagent's brief.
+    is_handoff: bool,
     /// A root the harness writes only for a subagent: its system prefix
     /// (telemetry operation `subagent_<profile>`), or the parentless copy of
     /// its task prompt.
     starts_subagent: bool,
+    /// A system prefix root of the persistent sidekick ([`PERSISTENT_PREFIX`]).
+    starts_persistent: bool,
 }
 
 impl NodeRef {
@@ -394,7 +410,9 @@ impl NodeRef {
             message_id,
             created_at: row.get(5)?,
             is_system: row.get(6)?,
-            starts_subagent: row.get(7)?,
+            is_handoff: row.get(7)?,
+            starts_subagent: row.get(8)?,
+            starts_persistent: row.get(9)?,
         }))
     }
 
@@ -413,23 +431,30 @@ impl NodeRef {
 /// Which pond sessions hold each message: owner 0 is the root session, owner
 /// `i` is the child named by `children[i - 1]`, the `message_id` of that
 /// subagent's task prompt. A message absent from `owners` belongs to the root
-/// alone; one listed with no owner waits for a sync that can name its
+/// alone; one listed with no owner is held back until a sync can name its
 /// subagent.
 #[derive(Default)]
 struct Forest {
     owners: HashMap<String, Vec<usize>>,
     children: Vec<String>,
     rejected: Vec<String>,
-    /// Every node in a subagent tree, for checking report-time links; never
-    /// read for ownership.
-    grouped_nodes: HashSet<i64>,
+    /// Every node in a subagent tree, mapped to its group, for checking
+    /// report-time links; never read for ownership.
+    grouped_nodes: HashMap<i64, i64>,
+    /// How many messages are held back, and the roots of the unnamed trees
+    /// placing them.
+    held: usize,
+    held_trees: Vec<i64>,
     /// Newest timestamp per owner, `None` when the owner holds no message.
     newest: Vec<Option<i64>>,
 }
 
 impl Forest {
     fn new(nodes: &[NodeRef]) -> Self {
-        let mut forest = if nodes.iter().any(|node| node.starts_subagent) {
+        let mut forest = if nodes
+            .iter()
+            .any(|node| node.starts_subagent || node.is_handoff)
+        {
             group_subagents(nodes)
         } else {
             Self::default()
@@ -457,6 +482,11 @@ impl Forest {
     }
 
     fn watermark(&self, owner: usize) -> SourceWatermark {
+        // Held-back messages are stored nowhere yet, so no stored watermark
+        // can cover them: the root stays pending until a sync names them.
+        if owner == 0 && self.held > 0 {
+            return SourceWatermark::Opaque;
+        }
         match self.newest.get(owner).copied().flatten() {
             Some(micros) => SourceWatermark::At(micros),
             None => SourceWatermark::Empty,
@@ -471,9 +501,31 @@ impl Forest {
 fn group_subagents(nodes: &[NodeRef]) -> Forest {
     let by_node: HashMap<i64, &NodeRef> = nodes.iter().map(|node| (node.node_id, node)).collect();
     let tree_of = tree_roots(&by_node);
-    let seeded = |node: &NodeRef| by_node[&tree_of[&node.node_id]].starts_subagent;
+    // The sidekick's live tree is rooted by a prefix no different from the
+    // lead's (telemetry `unknown`); only the handoff brief it holds marks it.
+    let handoff_trees: HashSet<i64> = nodes
+        .iter()
+        .filter(|node| node.is_handoff)
+        .map(|node| tree_of[&node.node_id])
+        .collect();
+    let seeded_trees: HashSet<i64> = tree_of
+        .values()
+        .copied()
+        .filter(|tree| handoff_trees.contains(tree) || by_node[tree].starts_subagent)
+        .collect();
+    let seeded = |node: &NodeRef| seeded_trees.contains(&tree_of[&node.node_id]);
+    let task_prompt = |node: &NodeRef| {
+        node.is_handoff
+            || (!node.is_system
+                && node.parent.is_none_or(|parent| {
+                    by_node
+                        .get(&parent)
+                        .is_some_and(|up| up.is_system && up.starts_subagent)
+                }))
+    };
 
-    // A main message two subagents both copied must not merge them.
+    // A main message two subagents both copied must not merge them, unless
+    // both open with it: a task prompt names exactly one subagent.
     let in_main: HashSet<&str> = nodes
         .iter()
         .filter(|node| !seeded(node))
@@ -481,25 +533,36 @@ fn group_subagents(nodes: &[NodeRef]) -> Forest {
         .collect();
     let mut sets: HashMap<i64, i64> = HashMap::new();
     let mut first_tree: HashMap<&str, i64> = HashMap::new();
-    for node in nodes.iter().filter(|node| {
-        seeded(node) && !node.is_system && !in_main.contains(node.message_id.as_str())
-    }) {
-        let tree = tree_of[&node.node_id];
-        match first_tree.entry(node.message_id.as_str()) {
-            Entry::Occupied(entry) => union(&mut sets, *entry.get(), tree),
-            Entry::Vacant(entry) => {
-                entry.insert(tree);
+    for node in nodes.iter().filter(|node| seeded(node)) {
+        if !node.is_system && (!in_main.contains(node.message_id.as_str()) || task_prompt(node)) {
+            let tree = tree_of[&node.node_id];
+            match first_tree.entry(node.message_id.as_str()) {
+                Entry::Occupied(entry) => union(&mut sets, *entry.get(), tree),
+                Entry::Vacant(entry) => {
+                    entry.insert(tree);
+                }
             }
+        }
+    }
+    // One agent across every handoff, even a tree that shares no message
+    // with the others yet: a fresh chain devin starts when its head is gone,
+    // or a brief written before its prefix copy.
+    let mut persistent = seeded_trees
+        .iter()
+        .filter(|&tree| handoff_trees.contains(tree) || by_node[tree].starts_persistent);
+    if let Some(&first) = persistent.next() {
+        for &tree in persistent {
+            union(&mut sets, first, tree);
         }
     }
 
     // Per message: whether a tree outside the subagents places it, and the
     // subagent groups whose trees do.
     let mut placed: HashMap<&str, (bool, Vec<i64>)> = HashMap::new();
-    // The task prompt: a non-system node that is parentless or sits directly
-    // under a subagent prefix root. It is the subagent's first message, so
-    // the earliest candidate wins and one arriving later cannot rename it.
+    // The task prompt is the subagent's first message, so the earliest
+    // candidate wins and one arriving later (a later brief) cannot rename it.
     let mut names: HashMap<i64, (i64, &str)> = HashMap::new();
+    let mut grouped_nodes = HashMap::new();
     for node in nodes {
         let (in_root, groups) = placed.entry(&node.message_id).or_default();
         if !seeded(node) {
@@ -507,16 +570,11 @@ fn group_subagents(nodes: &[NodeRef]) -> Forest {
             continue;
         }
         let group = find(&sets, tree_of[&node.node_id]);
+        grouped_nodes.insert(node.node_id, group);
         if !groups.contains(&group) {
             groups.push(group);
         }
-        let task_prompt = !node.is_system
-            && node.parent.is_none_or(|parent| {
-                by_node
-                    .get(&parent)
-                    .is_some_and(|up| up.is_system && up.starts_subagent)
-            });
-        if task_prompt {
+        if task_prompt(node) {
             let candidate = (node.micros(), node.message_id.as_str());
             let name = names.entry(group).or_insert(candidate);
             *name = (*name).min(candidate);
@@ -542,18 +600,14 @@ fn group_subagents(nodes: &[NodeRef]) -> Forest {
         .map(|(position, (_, group))| (*group, position + 1))
         .collect();
 
-    let grouped_nodes = nodes
-        .iter()
-        .filter(|node| seeded(node))
-        .map(|node| node.node_id)
-        .collect();
-
     let mut owners = HashMap::new();
+    let mut held = 0;
+    let mut held_groups = HashSet::new();
     for (message, (in_root, groups)) in placed {
         if groups.is_empty() {
             continue;
         }
-        let mut held: Vec<usize> = groups
+        let mut owned: Vec<usize> = groups
             .iter()
             .filter_map(|group| match index.get(group) {
                 Some(&owner) => Some(owner),
@@ -562,18 +616,29 @@ fn group_subagents(nodes: &[NodeRef]) -> Forest {
             })
             .collect();
         if in_root {
-            held.push(0);
+            owned.push(0);
         }
-        held.sort_unstable();
-        held.dedup();
-        owners.insert(message.to_owned(), held);
+        owned.sort_unstable();
+        owned.dedup();
+        if owned.is_empty() {
+            held += 1;
+            held_groups.extend(groups);
+        }
+        owners.insert(message.to_owned(), owned);
     }
+    let mut held_trees: Vec<i64> = seeded_trees
+        .into_iter()
+        .filter(|&tree| held_groups.contains(&find(&sets, tree)))
+        .collect();
+    held_trees.sort_unstable();
     let children = valid.into_iter().map(|(name, _)| name.to_owned()).collect();
     Forest {
         owners,
         children,
         rejected,
         grouped_nodes,
+        held,
+        held_trees,
         newest: Vec::new(),
     }
 }
@@ -635,17 +700,131 @@ fn child_id(session_id: &str, task_prompt: &str) -> String {
 
 // -- Reading -------------------------------------------------------------------
 
-/// One message: its newest `chat_message` (a later copy can only add fields -
-/// the ACP tool content lands after the fact), every older distinct variant,
-/// and every node placing it.
+/// One message: the `chat_message` its highest `node_id` placement holds, every
+/// other distinct variant, and every node placing it.
 struct Collected {
     newest: Value,
-    newest_raw: String,
     newest_row_id: i64,
     first: NodeRef,
     variants: Vec<Value>,
     nodes: Vec<Value>,
     tool_states: Vec<Value>,
+}
+
+/// One message's copies as its nodes stream in, before the newest is known.
+struct Copies {
+    first: NodeRef,
+    bodies: Vec<Body>,
+    placements: Vec<Placed>,
+    /// The placement with the highest `node_id`.
+    top: usize,
+}
+
+/// One distinct `chat_message` value among a message's copies.
+struct Body {
+    /// The text an identical copy matches without parsing.
+    raw: String,
+    value: Value,
+    lowest_node: i64,
+}
+
+struct Placed {
+    node_id: i64,
+    row_id: i64,
+    body: usize,
+    placement: Value,
+}
+
+impl Copies {
+    fn new(first: NodeRef) -> Self {
+        Self {
+            first,
+            bodies: Vec::new(),
+            placements: Vec::new(),
+            top: 0,
+        }
+    }
+
+    /// Adds `node`'s copy, holding `raw`; `None` when `raw` is not JSON.
+    fn place(&mut self, node: &NodeRef, raw: String, placement: Value) -> Option<()> {
+        let body = self.body_of(raw, node.node_id)?;
+        let lowest = &mut self.bodies[body].lowest_node;
+        *lowest = (*lowest).min(node.node_id);
+        if self
+            .placements
+            .get(self.top)
+            .is_none_or(|top| node.node_id > top.node_id)
+        {
+            self.top = self.placements.len();
+        }
+        self.placements.push(Placed {
+            node_id: node.node_id,
+            row_id: node.row_id,
+            body,
+            placement,
+        });
+        Some(())
+    }
+
+    /// The body `raw` holds, added when new. A copy can differ only in key
+    /// order and still be the same value, never a variant; its text then
+    /// replaces the stored one, so the next such copy matches without parsing.
+    fn body_of(&mut self, raw: String, node_id: i64) -> Option<usize> {
+        if let Some(known) = self.bodies.iter().position(|body| body.raw == raw) {
+            return Some(known);
+        }
+        let value: Value = serde_json::from_str(&raw).ok()?;
+        if let Some(known) = self.bodies.iter().position(|body| body.value == value) {
+            self.bodies[known].raw = raw;
+            return Some(known);
+        }
+        self.bodies.push(Body {
+            raw,
+            value,
+            lowest_node: node_id,
+        });
+        Some(self.bodies.len() - 1)
+    }
+
+    /// The highest `node_id` copy is the newest: node ids follow the writer's
+    /// allocation and survive a re-save, which renumbers `row_id`. Every
+    /// other body is a variant, ordered by the first node holding it; with
+    /// more than one body, each placement names its body as `variant` (0 for
+    /// the newest, `n` for `variants[n - 1]`).
+    fn finish(mut self) -> Collected {
+        let top = &self.placements[self.top];
+        let (newest_body, newest_row_id) = (top.body, top.row_id);
+        let mut others: Vec<usize> = (0..self.bodies.len())
+            .filter(|&body| body != newest_body)
+            .collect();
+        others.sort_by_key(|&body| self.bodies[body].lowest_node);
+        let mut tags = vec![0; self.bodies.len()];
+        for (position, &body) in others.iter().enumerate() {
+            tags[body] = position + 1;
+        }
+        let tagged = self.bodies.len() > 1;
+        let nodes = self
+            .placements
+            .into_iter()
+            .map(|placed| {
+                let mut placement = placed.placement;
+                if tagged {
+                    placement["variant"] = json!(tags[placed.body]);
+                }
+                placement
+            })
+            .collect();
+        let mut take = |body: usize| std::mem::take(&mut self.bodies[body].value);
+        let variants = others.iter().map(|&body| take(body)).collect();
+        Collected {
+            newest: take(newest_body),
+            newest_row_id,
+            first: self.first,
+            variants,
+            nodes,
+            tool_states: Vec::new(),
+        }
+    }
 }
 
 fn read_sessions(db: &Path, ids: &[String], tx: &mpsc::Sender<Result<AdapterYield, AdapterError>>) {
@@ -738,6 +917,21 @@ fn read_session(
             format!(
                 "subagent task prompt id {message_id:?} cannot name a child \
                  session; its messages stay with the parent"
+            ),
+        );
+        emit!(tx, Err(error));
+    }
+    if forest.held > 0 {
+        let error = AdapterError::schema(
+            NAME,
+            location.clone(),
+            format!(
+                "{} messages of the subagent trees rooted at nodes {:?} have no task \
+                 prompt to name their child session yet, so they are held back and \
+                 this session re-reads on every sync; run `pond sync` again once the \
+                 subagent has started; if this persists, devin aborted the spawn, \
+                 and only these messages stay unstored (nothing else to do)",
+                forest.held, forest.held_trees
             ),
         );
         emit!(tx, Err(error));
@@ -842,20 +1036,42 @@ impl SessionRead {
             }
         }
         let present: HashSet<i64> = self.refs.iter().map(|node| node.node_id).collect();
-        links
+        let mut reasons = Vec::new();
+        // A persistent subagent links once per handoff and moves its head
+        // each time; every head must still land in the one group it owns.
+        let mut groups: BTreeMap<String, BTreeMap<i64, i64>> = BTreeMap::new();
+        for (agent, head) in links {
+            let Some(agent) = agent else {
+                reasons.push(format!("subagent link to node {head} has no agent id"));
+                continue;
+            };
+            // A head devin since removed (a revert, a sidekick starting
+            // fresh) or a fork's copied link names nothing here.
+            if !present.contains(&head) {
+                continue;
+            }
+            match forest.grouped_nodes.get(&head) {
+                Some(&group) => {
+                    groups.entry(agent).or_default().entry(group).or_insert(head);
+                }
+                None => reasons.push(format!(
+                    "subagent agent {agent} links to node {head}, outside the detected subagent trees"
+                )),
+            }
+        }
+        for (agent, heads) in groups {
+            if heads.len() > 1 {
+                let mut heads: Vec<i64> = heads.into_values().collect();
+                heads.sort_unstable();
+                reasons.push(format!(
+                    "subagent agent {agent} links to nodes {heads:?} in separate subagent \
+                     tree groups, so its messages are split across sessions"
+                ));
+            }
+        }
+        reasons
             .into_iter()
-            .filter(|(agent, head)| {
-                agent.is_none() || (present.contains(head) && !forest.grouped_nodes.contains(head))
-            })
-            .map(|(agent, head)| {
-                let reason = match agent {
-                    Some(agent) => format!(
-                        "subagent agent {agent} links to node {head}, outside the detected subagent trees"
-                    ),
-                    None => format!("subagent link to node {head} has no agent id"),
-                };
-                AdapterError::schema(NAME, location, reason)
-            })
+            .map(|reason| AdapterError::schema(NAME, location, reason))
             .collect()
     }
 
@@ -918,33 +1134,34 @@ impl SessionRead {
     }
 
     /// Fold every node in as it streams, so only distinct message bodies stay
-    /// resident: an identical copy of the newest known form only adds a
-    /// placement; anything else is parsed.
+    /// resident: an identical copy of a known body only adds a placement;
+    /// anything else is parsed.
     fn collect_nodes(
         &mut self,
         conn: &Connection,
         id: &str,
         location: &str,
     ) -> rusqlite::Result<()> {
+        let mut copies: BTreeMap<String, Copies> = BTreeMap::new();
         let mut stmt = conn.prepare_cached(&node_query(", metadata, chat_message"))?;
         let mut rows = stmt.query([id])?;
         while let Some(row) = rows.next()? {
             let node_id: i64 = row.get(1)?;
-            let metadata: Option<String> = row.get(8)?;
-            let chat_message: String = row.get(9)?;
-            let node = NodeRef::from_row(row)?;
-            let parsed = node.and_then(|node| {
-                let known = self
-                    .collected
-                    .get(&node.message_id)
-                    .is_some_and(|entry| entry.newest_raw == chat_message);
-                if known {
-                    return Some((node, None));
+            let metadata: Option<String> = row.get(10)?;
+            let chat_message: String = row.get(11)?;
+            let placed = NodeRef::from_row(row)?.and_then(|node| {
+                let at = placement(&node, metadata.as_deref());
+                match copies.get_mut(&node.message_id) {
+                    Some(entry) => entry.place(&node, chat_message, at)?,
+                    None => {
+                        let mut entry = Copies::new(node.clone());
+                        entry.place(&node, chat_message, at)?;
+                        copies.insert(node.message_id.clone(), entry);
+                    }
                 }
-                let message = serde_json::from_str::<Value>(&chat_message).ok()?;
-                Some((node, Some(message)))
+                Some(node)
             });
-            let Some((node, message)) = parsed else {
+            let Some(node) = placed else {
                 self.errors.push(AdapterError::schema(
                     NAME,
                     format!("{location}/node {node_id}"),
@@ -952,43 +1169,12 @@ impl SessionRead {
                 ));
                 continue;
             };
-            let placement = placement(&node, metadata.as_deref());
-            match (self.collected.get_mut(&node.message_id), message) {
-                (Some(entry), None) => {
-                    entry.newest_row_id = node.row_id;
-                    entry.nodes.push(placement);
-                }
-                (Some(entry), Some(message)) => {
-                    // A copy can differ only in key order and still be the
-                    // same value; only a real change is a variant.
-                    if entry.newest != message {
-                        let older = std::mem::replace(&mut entry.newest, message);
-                        if !entry.variants.contains(&older) {
-                            entry.variants.push(older);
-                        }
-                    }
-                    entry.newest_raw = chat_message;
-                    entry.newest_row_id = node.row_id;
-                    entry.nodes.push(placement);
-                }
-                (None, Some(message)) => {
-                    self.collected.insert(
-                        node.message_id.clone(),
-                        Collected {
-                            newest: message,
-                            newest_raw: chat_message,
-                            newest_row_id: node.row_id,
-                            first: node.clone(),
-                            variants: Vec::new(),
-                            nodes: vec![placement],
-                            tool_states: Vec::new(),
-                        },
-                    );
-                }
-                (None, None) => unreachable!("an unknown message is always parsed"),
-            }
             self.refs.push(node);
         }
+        self.collected = copies
+            .into_iter()
+            .map(|(message_id, entry)| (message_id, entry.finish()))
+            .collect();
         Ok(())
     }
 
@@ -1211,6 +1397,7 @@ fn message_events(
         });
     };
     let text = content.clone().filter(|text| !text.is_empty());
+    let mut image_provenance = None;
 
     let canonical = match message.get("role").and_then(Value::as_str) {
         Some("user") => {
@@ -1228,6 +1415,7 @@ fn message_events(
             if let Some(text) = text {
                 push(provenance, PartKind::Text { text: Some(text) });
             }
+            image_provenance = Some(provenance);
             Message::User {
                 id: id.clone(),
                 session_id: session_id.to_owned(),
@@ -1270,6 +1458,7 @@ fn message_events(
                     },
                 );
             }
+            image_provenance = Some(Provenance::Conversational);
             Message::Assistant {
                 id: id.clone(),
                 session_id: session_id.to_owned(),
@@ -1293,6 +1482,7 @@ fn message_events(
                     result: message.get("content").cloned().unwrap_or(Value::Null),
                 },
             );
+            image_provenance = Some(Provenance::Injected);
             Message::Tool {
                 id: id.clone(),
                 session_id: session_id.to_owned(),
@@ -1310,11 +1500,41 @@ fn message_events(
             options,
         },
     };
+    // Images go after every other part kind: part ids are ordinal-keyed and
+    // an already-stored id is skipped, so an image ahead of the text would
+    // take the stored text part's id when a pre-image store re-reads it.
+    if let Some(provenance) = image_provenance {
+        for image in message
+            .get("images")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            push(provenance, image_part(image));
+        }
+    }
 
     let mut events = Vec::with_capacity(parts.len() + 1);
     events.push(IngestEvent::Message(canonical));
     events.extend(parts.into_iter().map(IngestEvent::Part));
     Ok(events)
+}
+
+/// One `chat_message.images[]` entry, devin's `ImageData {width, height,
+/// base64_data, mime_type, source_path, caption}` (docs/adapters/devin.md):
+/// the base64 payload verbatim (the whole entry as compact JSON when it has
+/// none, so the part is never dropped), `source_path` as the file name.
+/// Width, height and caption have no slot and stay in the raw record.
+fn image_part(image: &Value) -> PartKind {
+    let data = image
+        .get("base64_data")
+        .and_then(Value::as_str)
+        .map_or_else(|| compact_json(image), ToOwned::to_owned);
+    PartKind::File {
+        media_type: extract_str(image, "mime_type").map(|mime| mime.as_str().to_owned()),
+        file_name: extract_str(image, "source_path").map(|path| path.as_str().to_owned()),
+        data: FileData::String(data),
+    }
 }
 
 fn message_options(entry: &Collected) -> ProviderOptions {
@@ -1329,6 +1549,9 @@ fn message_options(entry: &Collected) -> ProviderOptions {
     if !entry.variants.is_empty() {
         let variants = entry.variants.iter().map(extract_raw_record).collect();
         devin.insert("variants".to_owned(), Value::Array(variants));
+    }
+    if let Some(phase) = entry.newest.get("phase").filter(|phase| !phase.is_null()) {
+        devin.insert("phase".to_owned(), phase.clone());
     }
     let mut options = ProviderOptions::new();
     options.insert(NAME.to_owned(), Value::Object(devin));
@@ -1541,12 +1764,17 @@ mod tests {
         );
     }
 
+    /// Every captured link head lands in the one group its agent owns -
+    /// including the sidekick's, whose `subagent_heads` row and link records
+    /// name two heads, the stale end of its first handoff and the live one.
     #[test]
     fn fixture_link_heads_belong_to_detected_subagent_trees() {
+        let mut heads_checked = 0;
         for db in [
             macos_root().join(DB_FILE),
             windows_root().join(DB_FILE),
             midrun_root().join("after").join("cli").join(DB_FILE),
+            sidekick_root().join(DB_FILE),
         ] {
             let conn = match open_forest(&db).unwrap() {
                 Opened::Forest(conn) => conn,
@@ -1560,8 +1788,10 @@ mod tests {
                     "{}#{id}",
                     db.display()
                 );
+                heads_checked += read.agent_heads.len();
             }
         }
+        assert_eq!(heads_checked, 1, "the sidekick's head row is checked");
     }
 
     #[test]
@@ -1635,11 +1865,13 @@ mod tests {
             message_id: "bad/id".to_owned(),
             created_at: None,
             is_system: false,
+            is_handoff: false,
             starts_subagent: true,
+            starts_persistent: false,
         };
         let forest = Forest::new(&[node]);
         assert_eq!(forest.rejected, vec!["bad/id"]);
-        assert!(forest.grouped_nodes.contains(&1));
+        assert!(forest.grouped_nodes.contains_key(&1));
     }
 
     #[test]
@@ -1757,7 +1989,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_record_row_id_is_its_newest_placement() {
+    fn raw_record_row_id_is_its_highest_node_placement() {
         let read = macos();
         for message in read.messages.values().flatten() {
             let options = message.options();
@@ -1765,23 +1997,180 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter_map(|node| node["row_id"].as_i64())
-                .max()
+                .max_by_key(|node| node["node_id"].as_i64())
                 .unwrap();
             assert_eq!(
                 options["source"]["row_id"],
-                json!(newest),
+                newest["row_id"],
                 "{}",
                 message.id()
             );
         }
     }
 
+    /// System-prefix churn: one `message_id` whose content changes between
+    /// context rebuilds, with a partial re-save putting the older content at
+    /// the highest `row_id`. The highest `node_id` copy is the raw record
+    /// whatever the row order, every other body is a variant, and each
+    /// placement names the body it held.
+    #[test]
+    fn drifted_copies_keep_every_body_and_tag_each_placement() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join(DB_FILE);
+        std::fs::copy(macos_root().join(DB_FILE), &db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        // The level-waterlily prefix message placed most often: at least three
+        // copies to split into drifted bodies.
+        let (message_id, nodes): (String, String) = conn
+            .query_row(
+                "SELECT chat_message ->> '$.message_id', group_concat(node_id)
+                 FROM (SELECT * FROM message_nodes WHERE session_id = 'level-waterlily'
+                       ORDER BY node_id)
+                 WHERE chat_message ->> '$.role' = 'system'
+                 GROUP BY 1 ORDER BY count(*) DESC, 1 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let nodes: Vec<i64> = nodes.split(',').map(|id| id.parse().unwrap()).collect();
+        assert!(nodes.len() >= 3, "{nodes:?}");
+        let (lowest, middle, highest) = (nodes[0], nodes[1], nodes[nodes.len() - 1]);
+        let drift = |node_id: i64, content: &str| {
+            conn.execute(
+                "UPDATE message_nodes SET chat_message = json_set(chat_message, '$.content', ?2)
+                 WHERE session_id = 'level-waterlily' AND node_id = ?1",
+                rusqlite::params![node_id, content],
+            )
+            .unwrap();
+        };
+        drift(lowest, "prompt v1");
+        drift(middle, "prompt v2");
+        for &node_id in &nodes[2..] {
+            drift(node_id, "prompt v3");
+        }
+        // The partial re-save: the lowest node gets the newest row id.
+        conn.execute(
+            "UPDATE message_nodes SET row_id = (SELECT max(row_id) + 1 FROM message_nodes)
+             WHERE session_id = 'level-waterlily' AND node_id = ?1",
+            [lowest],
+        )
+        .unwrap();
+        drop(conn);
+
+        let read = read(&db);
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        let message = read.messages["level-waterlily"]
+            .iter()
+            .find(|message| message.id() == format!("level-waterlily:{message_id}"))
+            .unwrap();
+        let options = message.options();
+        assert_eq!(
+            options["source"]["raw_record"]["content"],
+            json!("prompt v3")
+        );
+        let variants: Vec<&Value> = options[NAME]["variants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|variant| &variant["content"])
+            .collect();
+        assert_eq!(variants, [&json!("prompt v1"), &json!("prompt v2")]);
+        let tags: BTreeMap<i64, i64> = options[NAME]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| {
+                (
+                    node["node_id"].as_i64().unwrap(),
+                    node["variant"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        let expected: BTreeMap<i64, i64> = nodes
+            .iter()
+            .map(|&node_id| {
+                let tag = if node_id == lowest {
+                    1
+                } else if node_id == middle {
+                    2
+                } else {
+                    0
+                };
+                (node_id, tag)
+            })
+            .collect();
+        assert_eq!(tags, expected);
+        let placed = options[NAME]["nodes"].as_array().unwrap();
+        let top = placed.iter().find(|node| node["node_id"] == json!(highest));
+        assert_eq!(options["source"]["row_id"], top.unwrap()["row_id"]);
+
+        // A message with one body carries no tags.
+        for message in &read.messages["level-waterlily"] {
+            let options = message.options();
+            if options[NAME]["variants"].is_null() {
+                let nodes = options[NAME]["nodes"].as_array().unwrap();
+                assert!(nodes.iter().all(|node| node.get("variant").is_none()));
+            }
+        }
+    }
+
+    /// `phase` rides on the message's own options when the writer set it,
+    /// and no key appears when it did not.
+    #[test]
+    fn phase_is_surfaced_only_when_present() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join(DB_FILE);
+        std::fs::copy(macos_root().join(DB_FILE), &db).unwrap();
+        let commentary_id: String = {
+            let conn = Connection::open(&db).unwrap();
+            let message_id = conn
+                .query_row(
+                    "SELECT chat_message ->> '$.message_id' FROM message_nodes
+                     WHERE session_id = 'branch-candy' AND chat_message ->> '$.role' = 'assistant'
+                       AND json_type(chat_message, '$.phase') IS NULL
+                     ORDER BY node_id LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "UPDATE message_nodes
+                 SET chat_message = json_set(chat_message, '$.phase', 'commentary')
+                 WHERE session_id = 'branch-candy' AND chat_message ->> '$.message_id' = ?1",
+                [&message_id],
+            )
+            .unwrap();
+            message_id
+        };
+        let read = read(&db);
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        let phase_of = |message: &Message| message.options()[NAME].get("phase").cloned();
+        let mut phases = BTreeMap::new();
+        for message in read.messages.values().flatten() {
+            let raw = message.options()["source"]["raw_record"]
+                .get("phase")
+                .cloned();
+            assert_eq!(phase_of(message), raw, "{}", message.id());
+            if let Some(phase) = raw {
+                phases.insert(message.id().to_owned(), phase);
+            }
+        }
+        assert_eq!(
+            phases.get(&format!("branch-candy:{commentary_id}")),
+            Some(&json!("commentary"))
+        );
+        assert!(phases.values().any(|phase| phase == "final_answer"));
+        assert!(
+            read.messages["level-waterlily"]
+                .iter()
+                .any(|message| phase_of(message).is_none())
+        );
+    }
+
     #[test]
     fn tool_state_uses_only_results_and_unmatched_rows_stay_on_root() {
         let entry = |id: &str, newest: Value| Collected {
             newest,
-            newest_raw: String::new(),
             newest_row_id: 1,
             first: NodeRef {
                 row_id: 1,
@@ -1791,7 +2180,9 @@ mod tests {
                 message_id: id.to_owned(),
                 created_at: None,
                 is_system: false,
+                is_handoff: false,
                 starts_subagent: false,
+                starts_persistent: false,
             },
             variants: Vec::new(),
             nodes: Vec::new(),
@@ -1934,6 +2325,7 @@ mod tests {
         for stage in ["before", "after"] {
             assert_peek_matches_read(&midrun_root().join(stage).join("cli").join(DB_FILE));
         }
+        assert_peek_matches_read(&sidekick_root().join(DB_FILE));
     }
 
     /// Without `metadata.created_at` a message falls back to its first node's
@@ -2196,5 +2588,577 @@ mod tests {
                 .unwrap()
                 .contains("--to claude-code")
         );
+    }
+
+    /// A copy of the macOS fixture where every copy of each message carries
+    /// the given `chat_message.images` - the shape no capture produced,
+    /// grounded in the binary (docs/adapters/devin.md).
+    fn with_images(temp: &TempDir, images: &[(&str, Value)]) -> PathBuf {
+        let db = temp.path().join(DB_FILE);
+        std::fs::copy(macos_root().join(DB_FILE), &db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        for (message_id, images) in images {
+            let updated = conn
+                .execute(
+                    "UPDATE message_nodes
+                     SET chat_message = json_set(chat_message, '$.images', json(?1))
+                     WHERE json_extract(chat_message, '$.message_id') = ?2",
+                    rusqlite::params![images.to_string(), message_id],
+                )
+                .unwrap();
+            assert!(updated > 0, "{message_id}");
+        }
+        db
+    }
+
+    fn file_parts(parts: &[Part]) -> Vec<(Option<&str>, Option<&str>, &FileData)> {
+        parts
+            .iter()
+            .map(|part| match &part.kind {
+                PartKind::File {
+                    media_type,
+                    file_name,
+                    data,
+                } => (media_type.as_deref(), file_name.as_deref(), data),
+                other => panic!("{}: not a file part: {other:?}", part.id),
+            })
+            .collect()
+    }
+
+    /// The typed prompt of the headless `level-waterlily` session.
+    const WATERLILY_PROMPT: &str = "e5892e34-53bf-4780-98ca-fa93127b3926";
+
+    fn png(base64: &str, path: &str) -> Value {
+        json!({
+            "width": 1, "height": 1, "base64_data": base64,
+            "mime_type": "image/png", "source_path": path, "caption": null,
+        })
+    }
+
+    /// Images land after every part the message already emitted, so a store
+    /// written before images were read keeps its text, reasoning, tool-call
+    /// and tool-result part ids when a re-read adds the images: every
+    /// existing part keeps its ordinal, and only File parts follow.
+    #[test]
+    fn images_become_file_parts_after_the_existing_parts() {
+        const TYPED: &str = "4efb7e3f-b402-4e54-be24-f83d5771d2aa";
+        const CALLS: &str = "520f2475-34a4-4c06-b0a4-082c7b1b32d1";
+        const RESULT: &str = "f3e4968f-c6dc-4108-ad89-dfa3dac613d5";
+        let before = macos();
+        let temp = TempDir::new().unwrap();
+        let db = with_images(
+            &temp,
+            &[
+                (TYPED, json!([png("aGk=", "/tmp/pasted-images/a.png")])),
+                (CALLS, json!([png("Ynll", "/tmp/b.png")])),
+                (
+                    RESULT,
+                    json!([png("eW8=", "/tmp/c.png"), png("d2F2", "/tmp/d.png")]),
+                ),
+            ],
+        );
+        let after = read(&db);
+        assert!(after.errors.is_empty(), "{:?}", after.errors);
+
+        for (id, earlier) in &before.parts {
+            let parts = &after.parts[id];
+            assert_eq!(&parts[..earlier.len()], earlier.as_slice(), "{id}");
+            let added = &parts[earlier.len()..];
+            let expected = match id.strip_prefix("branch-candy:") {
+                Some(TYPED | CALLS) => 1,
+                Some(RESULT) => 2,
+                _ => 0,
+            };
+            assert_eq!(added.len(), expected, "{id}");
+            for (offset, part) in added.iter().enumerate() {
+                let ordinal = earlier.len() + offset;
+                assert_eq!(part.id, part_id(id, ordinal));
+                assert_eq!(part.ordinal, part_ordinal(ordinal));
+            }
+        }
+
+        let parts = |message: &str| &after.parts[&format!("branch-candy:{message}")];
+        let typed = parts(TYPED);
+        assert!(matches!(typed[0].kind, PartKind::Text { .. }));
+        assert_eq!(
+            file_parts(&typed[1..]),
+            [(
+                Some("image/png"),
+                Some("/tmp/pasted-images/a.png"),
+                &FileData::String("aGk=".to_owned())
+            )]
+        );
+        assert_eq!(typed[1].provenance, Provenance::Conversational);
+
+        let calls = parts(CALLS);
+        assert!(matches!(
+            calls[calls.len() - 2].kind,
+            PartKind::ToolCall { .. }
+        ));
+        assert_eq!(calls.last().unwrap().provenance, Provenance::Conversational);
+
+        let result = parts(RESULT);
+        assert!(matches!(result[0].kind, PartKind::ToolResult { .. }));
+        assert_eq!(
+            file_parts(&result[1..]),
+            [
+                (
+                    Some("image/png"),
+                    Some("/tmp/c.png"),
+                    &FileData::String("eW8=".to_owned())
+                ),
+                (
+                    Some("image/png"),
+                    Some("/tmp/d.png"),
+                    &FileData::String("d2F2".to_owned())
+                ),
+            ]
+        );
+        assert!(
+            result[1..]
+                .iter()
+                .all(|part| part.provenance == Provenance::Injected)
+        );
+    }
+
+    /// A pasted image with no typed text is the message's only part.
+    #[test]
+    fn a_message_with_only_images_yields_only_file_parts() {
+        let temp = TempDir::new().unwrap();
+        let db = with_images(
+            &temp,
+            &[(WATERLILY_PROMPT, json!([png("aGk=", "/tmp/a.png")]))],
+        );
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "UPDATE message_nodes SET chat_message = json_set(chat_message, '$.content', '')
+                 WHERE json_extract(chat_message, '$.message_id') = ?1",
+                [WATERLILY_PROMPT],
+            )
+            .unwrap();
+        let read = read(&db);
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        let id = format!("level-waterlily:{WATERLILY_PROMPT}");
+        let parts = &read.parts[&id];
+        assert_eq!(
+            file_parts(parts),
+            [(
+                Some("image/png"),
+                Some("/tmp/a.png"),
+                &FileData::String("aGk=".to_owned())
+            )]
+        );
+        assert_eq!(parts[0].id, part_id(&id, 0));
+        assert_eq!(parts[0].provenance, Provenance::Conversational);
+    }
+
+    /// An image without `mime_type` or `source_path` still yields its part,
+    /// those fields absent rather than defaulted (spec.md#model-no-synthesis).
+    #[test]
+    fn an_image_without_a_type_or_path_leaves_them_absent() {
+        let temp = TempDir::new().unwrap();
+        let bare = json!([{"width": 2, "height": 3, "base64_data": "aGk="}]);
+        let read = read(&with_images(&temp, &[(WATERLILY_PROMPT, bare)]));
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        let parts = &read.parts[&format!("level-waterlily:{WATERLILY_PROMPT}")];
+        assert!(matches!(parts[0].kind, PartKind::Text { .. }));
+        assert_eq!(
+            file_parts(&parts[1..]),
+            [(None, None, &FileData::String("aGk=".to_owned()))]
+        );
+    }
+
+    /// An entry without `base64_data` still yields its part, the whole entry
+    /// as compact JSON, its own type and path kept.
+    #[test]
+    fn an_image_without_base64_data_keeps_the_whole_entry() {
+        let temp = TempDir::new().unwrap();
+        let entry = json!({"width": 2, "mime_type": "image/png", "source_path": "/tmp/a.png"});
+        let read = read(&with_images(&temp, &[(WATERLILY_PROMPT, json!([entry]))]));
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        let parts = &read.parts[&format!("level-waterlily:{WATERLILY_PROMPT}")];
+        assert!(matches!(parts[0].kind, PartKind::Text { .. }));
+        assert_eq!(
+            file_parts(&parts[1..]),
+            [(
+                Some("image/png"),
+                Some("/tmp/a.png"),
+                &FileData::String(compact_json(&entry))
+            )]
+        );
+    }
+
+    fn sidekick_root() -> std::path::PathBuf {
+        crate::adapter::test_support::manifest_dir()
+            .join("tests/fixtures/adapter/devin/sidekick/cli")
+    }
+    const SIDEKICK_PARENT: &str = "third-hourglass";
+    const SIDEKICK_CHILD: &str = "third-hourglass/agent-b1e7050f-7a5a-42b4-a669-ddf4c4e03361";
+    const EXPLORE_CHILD: &str = "third-hourglass/agent-3fc38d38-f601-4976-8786-4d13059aa112";
+
+    /// Every node id the stored messages of `session` place.
+    fn placements(read: &Read, session: &str) -> BTreeSet<i64> {
+        read.messages[session]
+            .iter()
+            .flat_map(|message| message.options()[NAME]["nodes"].as_array().unwrap())
+            .map(|node| node["node_id"].as_i64().unwrap())
+            .collect()
+    }
+
+    /// Each pond session with the message ids it holds.
+    fn ownership(read: &Read) -> BTreeMap<String, BTreeSet<String>> {
+        read.messages
+            .iter()
+            .map(|(id, messages)| {
+                let ids = messages.iter().map(|m| m.id().to_owned()).collect();
+                (id.clone(), ids)
+            })
+            .collect()
+    }
+
+    /// A copy of the sidekick capture with `edit` applied to it.
+    fn forged_sidekick(temp: &TempDir, edit: impl FnOnce(&Connection)) -> PathBuf {
+        let db = temp.path().join(DB_FILE);
+        std::fs::copy(sidekick_root().join(DB_FILE), &db).unwrap();
+        edit(&Connection::open(&db).unwrap());
+        db
+    }
+
+    /// One forged node of the sidekick session, stamped `at` seconds after
+    /// 2026-09-29T22:00:00Z, after every captured node; `extensions`
+    /// lands in `metadata.extensions`.
+    fn add_node(
+        conn: &Connection,
+        (node_id, parent): (i64, Option<i64>),
+        (role, message_id, operation): (&str, &str, &str),
+        at: i64,
+        extensions: &Value,
+    ) {
+        let created = DateTime::from_timestamp(1_790_719_200 + at, 0).unwrap();
+        let chat_message = json!({
+            "message_id": message_id,
+            "role": role,
+            "content": message_id,
+            "metadata": {
+                "created_at": created.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                "telemetry": { "source": role, "operation": operation },
+                "extensions": extensions,
+            },
+        });
+        conn.execute(
+            "INSERT INTO message_nodes (session_id, node_id, parent_node_id, chat_message,
+                 created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                SIDEKICK_PARENT,
+                node_id,
+                parent,
+                chat_message.to_string(),
+                created.timestamp()
+            ],
+        )
+        .unwrap();
+    }
+
+    fn read_sidekick() -> Read {
+        let read = read(&sidekick_root().join(DB_FILE));
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        read
+    }
+
+    /// The captured Local Fusion session: two sidekick handoffs, the second
+    /// brief appended to the first handoff's report inside ONE live tree
+    /// whose root carries no subagent telemetry, plus the per-handoff prefix
+    /// copies (`subagent_sidekick`), a parentless brief and an explore
+    /// subagent. The sidekick is one child holding its whole chain - both
+    /// briefs and both reports - named by its first brief; the parent keeps
+    /// the lead's chain and every link record; every node is stored.
+    #[test]
+    fn a_persistent_sidekick_is_one_child_across_handoffs() {
+        let read = read_sidekick();
+        let sessions: Vec<&str> = read.sessions.keys().map(String::as_str).collect();
+        assert_eq!(sessions, [SIDEKICK_PARENT, EXPLORE_CHILD, SIDEKICK_CHILD]);
+        let child = &read.sessions[SIDEKICK_CHILD];
+        assert_eq!(child.source_agent, SUBAGENT_AGENT);
+        assert_eq!(child.parent_session_id.as_deref(), Some(SIDEKICK_PARENT));
+        let brief: DateTime<chrono::Utc> = "2026-09-29T21:31:41.519472Z".parse().unwrap();
+        assert_eq!(child.created_at, brief);
+
+        let (root, sidekick) = (
+            placements(&read, SIDEKICK_PARENT),
+            placements(&read, SIDEKICK_CHILD),
+        );
+        let work: Vec<i64> = (94..=103).chain([155]).chain(174..=178).collect();
+        for node in &work {
+            assert!(sidekick.contains(node) && !root.contains(node), "{node}");
+        }
+        for node in [105, 106, 180, 181, 207] {
+            assert!(root.contains(&node) && !sidekick.contains(&node), "{node}");
+        }
+        for message in ["b1e7050f", "bad34eff", "04fd5885", "07f67def"] {
+            let held = |session: &str| {
+                read.messages[session]
+                    .iter()
+                    .any(|m| m.id().split(':').nth(1).unwrap().starts_with(message))
+            };
+            assert!(held(SIDEKICK_CHILD) && !held(SIDEKICK_PARENT), "{message}");
+        }
+        let stored: BTreeSet<i64> = read
+            .sessions
+            .keys()
+            .flat_map(|id| placements(&read, id))
+            .collect();
+        assert_eq!(stored, (0..=207).collect(), "every node is stored");
+    }
+
+    /// #315's real sessions yielded no child where devin wrote no parentless
+    /// brief; the brief's `subagent/handoff` copies name the child without it.
+    #[test]
+    fn a_sidekick_without_its_parentless_brief_keeps_its_name() {
+        let temp = TempDir::new().unwrap();
+        // The parentless brief's whole tree: the brief (85) and the two
+        // system notes devin writes beneath it (92, 93).
+        let db = forged_sidekick(&temp, |conn| {
+            conn.execute(
+                "DELETE FROM message_nodes WHERE node_id IN (85, 92, 93)",
+                [],
+            )
+            .unwrap();
+        });
+        let read = read(&db);
+        assert!(read.errors.is_empty(), "{:?}", read.errors);
+        let full = read_sidekick();
+        assert_eq!(read.sessions[SIDEKICK_CHILD], full.sessions[SIDEKICK_CHILD]);
+        assert_eq!(read.sessions.len(), 3);
+        assert!(placements(&read, SIDEKICK_CHILD).is_superset(&(94..=103).collect()));
+    }
+
+    /// A sync at any point of either handoff stores a subset of what the
+    /// final sync stores, each message in the same session, under the same
+    /// child row: the first brief names the child, and the second brief
+    /// arriving later cannot rename it.
+    #[test]
+    fn a_sync_mid_handoff_stores_what_a_later_one_would() {
+        let full = read_sidekick();
+        let later: BTreeSet<String> = ownership(&full).into_values().flatten().collect();
+        for cut in [96, 103, 106, 155, 176, 178] {
+            let temp = TempDir::new().unwrap();
+            let db = forged_sidekick(&temp, |conn| {
+                conn.execute("DELETE FROM message_nodes WHERE node_id > ?1", [cut])
+                    .unwrap();
+            });
+            let early = read(&db);
+            assert!(early.errors.is_empty(), "{cut}: {:?}", early.errors);
+            assert_eq!(
+                early.sessions[SIDEKICK_CHILD], full.sessions[SIDEKICK_CHILD],
+                "{cut}"
+            );
+            let stored: BTreeSet<String> = ownership(&early).into_values().flatten().collect();
+            let moved: Vec<&String> = stored.difference(&later).collect();
+            assert!(moved.is_empty(), "{cut}: {moved:?}");
+            assert_peek_matches_read(&db);
+        }
+    }
+
+    /// The partition never reads `subagent_heads`: emptied, pointing at a
+    /// node devin since removed (it then starts fresh), or naming another
+    /// agent's node, the rows change nothing but the check; only a head in a
+    /// main tree is drift.
+    #[test]
+    fn subagent_heads_are_checked_but_never_partition() {
+        let full = ownership(&read_sidekick());
+        for (edit, drift) in [
+            ("DELETE FROM subagent_heads", None),
+            ("UPDATE subagent_heads SET chain_node_id = 999", None),
+            (
+                "INSERT INTO subagent_heads (session_id, agent_id, chain_node_id, updated_at)
+                 VALUES ('third-hourglass', 'a90f5090', 203, 1)",
+                None,
+            ),
+            (
+                "UPDATE subagent_heads SET chain_node_id = 1",
+                Some("sidekick links to node 1,"),
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let db = forged_sidekick(&temp, |conn| {
+                conn.execute(edit, []).unwrap();
+            });
+            let read = read(&db);
+            let reasons: Vec<String> = read.errors.iter().map(ToString::to_string).collect();
+            match drift {
+                None => assert!(reasons.is_empty(), "{edit}: {reasons:?}"),
+                Some(needle) => {
+                    assert_eq!(reasons.len(), 1, "{edit}: {reasons:?}");
+                    assert!(reasons[0].contains(needle), "{reasons:?}");
+                }
+            }
+            assert_eq!(ownership(&read), full, "{edit}");
+        }
+    }
+
+    /// A link record whose head lies in no subagent tree, or one naming the
+    /// sidekick while pointing into the explore subagent's trees, is drift;
+    /// neither reassigns a message.
+    #[test]
+    fn a_sidekick_link_outside_its_group_reports_drift() {
+        let full = ownership(&read_sidekick());
+        for (node, head, agent, needle) in [
+            (181, 1, "sidekick", "sidekick links to node 1,"),
+            (205, 203, "sidekick", "sidekick links to nodes [103, 203]"),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let db = forged_sidekick(&temp, |conn| {
+                conn.execute(
+                    "UPDATE message_nodes SET chat_message = json_set(chat_message,
+                         '$.metadata.extensions.\"subagent/chain_node_id\"', ?2,
+                         '$.metadata.extensions.\"subagent/agent_id\"', ?3)
+                     WHERE node_id = ?1",
+                    rusqlite::params![node, head, agent],
+                )
+                .unwrap();
+            });
+            let read = read(&db);
+            let reasons: Vec<String> = read.errors.iter().map(ToString::to_string).collect();
+            assert_eq!(reasons.len(), 1, "{reasons:?}");
+            assert!(reasons[0].contains(needle), "{reasons:?}");
+            assert_eq!(ownership(&read), full);
+        }
+    }
+
+    /// A third handoff that starts fresh - its stored head gone, so its live
+    /// tree and prefix copy share no message with the first two - is still
+    /// the same agent: one child, the same name, its brief and report
+    /// inside, and its link heads accepted. That holds at every cut once a
+    /// fresh tree holds the brief, before its prefix copy exists and whether
+    /// or not a parentless brief comes first. A compaction continuing the
+    /// live tree stays in the child; the summarizer chain stays with the root.
+    #[test]
+    fn a_fresh_handoff_and_a_compaction_stay_in_the_one_sidekick_child() {
+        let (none, brief) = (json!({}), json!({ "subagent/handoff": true }));
+        let link = json!({ "subagent/agent_id": "sidekick", "subagent/chain_node_id": 303 });
+        let forged = [
+            (299, None, "user", "brief-3", "unknown", 2, &brief),
+            (300, None, "system", "fresh-root", "unknown", 0, &none),
+            (301, Some(300), "system", "fresh-model", "unknown", 1, &none),
+            (302, Some(301), "user", "brief-3", "unknown", 2, &brief),
+            (
+                303,
+                Some(302),
+                "assistant",
+                "report-3",
+                "inference",
+                3,
+                &none,
+            ),
+            (
+                310,
+                None,
+                "system",
+                "fresh-prefix",
+                PERSISTENT_PREFIX,
+                0,
+                &none,
+            ),
+            (311, Some(310), "system", "fresh-model", "unknown", 1, &none),
+            (312, Some(311), "user", "brief-3", "unknown", 2, &brief),
+            (320, Some(207), "system", "done-3", "unknown", 4, &link),
+            (330, Some(94), "system", "continuing", "unknown", 5, &none),
+            (
+                331,
+                Some(330),
+                "assistant",
+                "after-compaction",
+                "inference",
+                6,
+                &none,
+            ),
+            (340, None, "system", "summarizer", "unknown", 5, &none),
+            (
+                341,
+                Some(340),
+                "user",
+                "summarize-this",
+                "unknown",
+                6,
+                &none,
+            ),
+        ];
+        for parentless_brief in [false, true] {
+            for cut in [299, 302, 312, 341] {
+                let written = |node_id: i64| node_id <= cut && (parentless_brief || node_id != 299);
+                let temp = TempDir::new().unwrap();
+                let db = forged_sidekick(&temp, |conn| {
+                    for (node_id, parent, role, message_id, operation, at, extensions) in forged {
+                        if written(node_id) {
+                            add_node(
+                                conn,
+                                (node_id, parent),
+                                (role, message_id, operation),
+                                at,
+                                extensions,
+                            );
+                        }
+                    }
+                    conn.execute("UPDATE subagent_heads SET chain_node_id = 303", [])
+                        .unwrap();
+                });
+                let case = format!("parentless brief {parentless_brief}, cut {cut}");
+                let read = read(&db);
+                assert!(read.errors.is_empty(), "{case}: {:?}", read.errors);
+                assert_eq!(read.sessions.len(), 3, "{case}: {:?}", read.sessions.keys());
+                let child = placements(&read, SIDEKICK_CHILD);
+                let sidekick = [299, 300, 301, 302, 303, 310, 311, 312, 330, 331];
+                for node in sidekick
+                    .into_iter()
+                    .filter(|&node| written(node))
+                    .chain([94, 178])
+                {
+                    assert!(child.contains(&node), "{case}: {node}");
+                }
+                let root = placements(&read, SIDEKICK_PARENT);
+                for node in [320, 340, 341].into_iter().filter(|&node| written(node)) {
+                    assert!(
+                        root.contains(&node) && !child.contains(&node),
+                        "{case}: {node}"
+                    );
+                }
+                assert_peek_matches_read(&db);
+            }
+        }
+    }
+
+    /// A subagent tree nothing names is held back, never silently dropped:
+    /// the read reports it and the root stays pending, so each sync re-reads
+    /// it until a task prompt arrives.
+    #[test]
+    fn an_unnamed_subagent_tree_is_reported_and_keeps_the_root_pending() {
+        let temp = TempDir::new().unwrap();
+        let db = forged_sidekick(&temp, |conn| {
+            let none = json!({});
+            add_node(
+                conn,
+                (400, None),
+                ("system", "orphan-prefix", "subagent_general"),
+                0,
+                &none,
+            );
+            add_node(
+                conn,
+                (401, Some(400)),
+                ("system", "orphan-model", "unknown"),
+                1,
+                &none,
+            );
+        });
+        let read = read(&db);
+        let reasons: Vec<String> = read.errors.iter().map(ToString::to_string).collect();
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(
+            reasons[0].contains("2 messages of the subagent trees rooted at nodes [400]"),
+            "{reasons:?}"
+        );
+        assert_eq!(ownership(&read), ownership(&read_sidekick()));
+        assert_eq!(peeked(&db)[SIDEKICK_PARENT], SourceWatermark::Opaque);
     }
 }
