@@ -2257,6 +2257,44 @@ impl Store {
         Ok(imported.len())
     }
 
+    /// Remove `session_id`'s intent key from both tables - the operator's
+    /// per-store reversal of a denylist entry. Returns the lifted value (the
+    /// `sessions` replica's when both carry one), or `None` when this store
+    /// does not denylist the id. Rows and the erase epoch are left untouched.
+    pub async fn lift_erase_intent(&self, session_id: &str) -> Result<Option<String>> {
+        let key = erase::intent_key(session_id);
+        let (sessions, messages) = tokio::try_join!(
+            self.handle.dataset(Table::Sessions),
+            self.handle.dataset(Table::Messages),
+        )?;
+        let Some(value) = sessions
+            .config()
+            .get(&key)
+            .or_else(|| messages.config().get(&key))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        // A replica left behind keeps the id denylisted, so a re-run is safe.
+        tokio::try_join!(
+            self.handle.remove_config_key(Table::Sessions, &key),
+            self.handle.remove_config_key(Table::Messages, &key),
+        )
+        .with_context(|| {
+            format!(
+                "lift of \"{session_id}\" may be partial; re-run pond erase --lift {session_id}"
+            )
+        })?;
+        Ok(Some(value))
+    }
+
+    /// The raw `pond.erase.epoch` value on `messages`, for surfaces that show
+    /// it verbatim; [`EraseEpoch::from_value`] classifies it.
+    pub async fn erase_epoch_value(&self) -> Result<Option<String>> {
+        let dataset = self.handle.dataset(Table::Messages).await?;
+        Ok(dataset.config().get(erase::EPOCH_KEY).cloned())
+    }
+
     /// Whether local self-heal rolled `messages` back when this store opened.
     /// A rollback can restore an epoch that a pre-erase chain or cursor matches
     /// again, so every derived signal from before it is untrusted.
@@ -11348,6 +11386,64 @@ mod tests {
         );
         assert!(!messages.contains_key("pond.erase.op.x"));
         assert!(!messages.contains_key(crate::erase::EPOCH_KEY));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lift_clears_both_replicas_and_returns_the_intent() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        store
+            .import_erase_intent(std::future::ready(Ok(BTreeMap::from([intent(
+                "root", "gone",
+            )]))))
+            .await?;
+        set_erase_epoch(&store, SETTLED_EPOCH).await?;
+        assert!(store.is_erased("gone").await?);
+
+        let lifted = store.lift_erase_intent("gone").await?.expect("denylisted");
+        assert_eq!(
+            serde_json::from_str::<crate::erase::ErasedIntent>(&lifted)?.root,
+            "root"
+        );
+        assert!(!store.is_erased("gone").await?);
+        assert!(store.erased_session_ids().await?.is_empty());
+        assert_eq!(
+            store.erase_epoch_value().await?.as_deref(),
+            Some(SETTLED_EPOCH),
+            "a lift never moves the epoch"
+        );
+        assert_eq!(store.lift_erase_intent("never-erased").await?, None);
+        Ok(())
+    }
+
+    /// A replica an interrupted import left on one table still lifts without
+    /// a commit on the other, and a value that is not intent JSON lifts
+    /// verbatim.
+    #[tokio::test]
+    async fn lift_clears_a_single_replica_with_any_value() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let store = Store::open_local(temp.path()).await?;
+        ingest_events(&store, conversational_events("kept", 1)).await?;
+        let key = crate::erase::intent_key("gone");
+        store
+            .handle
+            .set_config(Table::Messages, &[(key.as_str(), "not json")])
+            .await?;
+        assert!(store.is_erased("gone").await?);
+        let sessions_before = store.handle.dataset(Table::Sessions).await?.version_id();
+
+        assert_eq!(
+            store.lift_erase_intent("gone").await?.as_deref(),
+            Some("not json")
+        );
+        assert!(!store.is_erased("gone").await?);
+        assert_eq!(
+            store.handle.dataset(Table::Sessions).await?.version_id(),
+            sessions_before,
+            "the table without the key commits nothing"
+        );
+        assert_eq!(store.session_ids().await?, vec!["kept".to_owned()]);
         Ok(())
     }
 

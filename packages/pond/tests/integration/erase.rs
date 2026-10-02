@@ -3,7 +3,11 @@
 //! and proves sync, copy, archive restore and the read surfaces all honor it.
 //! Single-module behavior (the ingest chokepoint, copy planning, the epoch
 //! gates) is unit-tested beside its code.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "tests fail by panicking"
+)]
 
 use std::collections::BTreeMap;
 use std::future::{Ready, ready};
@@ -101,6 +105,25 @@ async fn sync_never_imports_an_erased_session_and_the_plan_counts_it() -> anyhow
     assert_eq!(again.inserted, 0);
     assert_eq!(again.skipped_erased, 1, "reported as erased, not fresh");
     assert!(!store.session_ids().await?.contains(&erased));
+    Ok(())
+}
+
+/// A lifted denylist entry stops withholding: the next sync from the
+/// still-present source re-ingests the session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lifted_session_re_ingests_on_the_next_sync() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let ids = fixture_ids(&temp).await?;
+    let store = Store::open_local(temp.path().join("store")).await?;
+    store.import_erase_intent(intent(&ids[0])).await?;
+    assert!(sync_fixtures(&store).await?.denylisted > 0);
+    assert!(!store.session_ids().await?.contains(&ids[0]));
+
+    assert!(store.lift_erase_intent(&ids[0]).await?.is_some());
+    let resync = sync_fixtures(&store).await?;
+    assert_eq!(resync.sessions_inserted, 1);
+    assert_eq!(resync.denylisted, 0);
+    assert_eq!(store.session_ids().await?.len(), ids.len());
     Ok(())
 }
 

@@ -329,6 +329,7 @@ Commands:
     sync         Make pond current: import, embed, index
     optimize     Embed the backlog, then fold the indexes
     copy         Copy data between stores, archives, JSONL
+    erase        Lift a session's erase denylist entry
 
   Query
     search       Search stored messages
@@ -560,7 +561,7 @@ enum Command {
   pond status                       the one-screen overview
   pond status --hosts               which machines feed this store, and when
   pond status --include-subagents   count each subagent as its own adapter")]
-    #[command(display_order = 15)]
+    #[command(display_order = 16)]
     Status {
         /// Count each sub-agent `source_agent` (e.g. `claude-code/general-purpose`)
         /// as its own adapter. Default counts only main agents.
@@ -585,7 +586,7 @@ enum Command {
   pond search \"auth retry\" --project pond --limit 5
   pond search \"merge_insert\" --mode fts --sort-by recency
   pond search \"migration plan\" --from-date 2026-05-01 --format json")]
-    #[command(display_order = 10)]
+    #[command(display_order = 11)]
     Search {
         /// Free-text query: the distinctive words you expect in the
         /// conversation. Project names belong in `--project`.
@@ -639,7 +640,7 @@ enum Command {
   pond get-session 58a96901-4a4f-40be-a3c1-62419ec8c580
   pond get-session <ID> --from end               most recent messages
   pond get-session <ID> --after-message-id <ID>  page down")]
-    #[command(display_order = 11)]
+    #[command(display_order = 12)]
     GetSession {
         /// Session id (a message id resolves to its parent session).
         #[arg(value_name = "ID")]
@@ -677,7 +678,7 @@ enum Command {
     #[command(after_long_help = "Examples:
   pond get-message <ID>
   pond get-message <ID> --context-before 5 --context-after 5")]
-    #[command(display_order = 12)]
+    #[command(display_order = 13)]
     GetMessage {
         /// Message id.
         #[arg(value_name = "ID")]
@@ -707,7 +708,7 @@ enum Command {
   pond sql \"SELECT count(*) FROM sessions\"
   pond sql \"SELECT session_id, ts, role FROM messages WHERE contains_tokens(search_text, 'occ retry') LIMIT 20\"
   pond sql \"SELECT * FROM messages\" --format parquet -o messages.parquet")]
-    #[command(display_order = 13)]
+    #[command(display_order = 14)]
     Sql {
         /// The SQL query. Wrap in quotes; remember to escape `$` in zsh/bash.
         sql: String,
@@ -741,7 +742,7 @@ enum Command {
 
 --out-dir is the directory the adapter's own layout is rooted at, so for
 pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
-    #[command(display_order = 14)]
+    #[command(display_order = 15)]
     Resume {
         /// Session id (from `pond search`).
         #[arg(value_name = "SESSION_ID")]
@@ -762,7 +763,7 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
     /// setups want `pond mcp` instead; `serve` is for the HTTP transport and
     /// for supervised deployments.
     #[command(after_long_help = SERVE_EXAMPLES_HELP)]
-    #[command(display_order = 16)]
+    #[command(display_order = 17)]
     Serve {
         /// Wire transport: the HTTP API, or MCP over stdio.
         #[arg(long, value_enum, default_value_t = ServeTransport::Http)]
@@ -838,7 +839,7 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
     #[command(after_long_help = "Examples:
   claude mcp add -s user pond -- pond mcp    register in Claude Code
   codex mcp add pond -- pond mcp             register in Codex CLI")]
-    #[command(display_order = 17)]
+    #[command(display_order = 18)]
     Mcp {},
     /// Manage the automatic sync schedule.
     ///
@@ -924,6 +925,23 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
         #[arg(long)]
         verify_only: bool,
     },
+    /// Lift a session's erase denylist entry on this store.
+    ///
+    /// `--lift` removes this session's denylist entry on this store only,
+    /// typically one imported by `pond copy` or an archive restore. It deletes
+    /// no data: the next `pond sync` re-ingests the session if a source still
+    /// holds it, and a copy from a store that still denylists it re-imports
+    /// the entry.
+    #[command(after_long_help = "Examples:
+  pond erase --lift 0192d4a8-6f1e-7c3a-9b2d-5e8f7a6b4c3d   let a denylisted session sync again")]
+    #[command(display_order = 10)]
+    Erase {
+        /// The denylisted session id.
+        session_id: String,
+        /// Remove the session's denylist entry.
+        #[arg(long, required = true)]
+        lift: bool,
+    },
     /// Inspect configuration.
     ///
     /// Resolved values with provenance (show), the config file location
@@ -946,7 +964,7 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
          (needs an execution policy of RemoteSigned or looser)
 
 Homebrew and nix packages ship these pre-installed, as does the Windows zip.")]
-    #[command(display_order = 18)]
+    #[command(display_order = 19)]
     Completions {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
@@ -955,7 +973,7 @@ Homebrew and nix packages ship these pre-installed, as does the Windows zip.")]
     ///
     /// The same file an agent loads as a skill, emitted to stdout so it stays in
     /// lockstep with the binary (no separate copy to drift).
-    #[command(display_order = 19)]
+    #[command(display_order = 20)]
     Skill,
     /// Keep the lake queryable: embed the backlog, then fold the search indexes.
     ///
@@ -1509,6 +1527,8 @@ async fn run() -> anyhow::Result<()> {
                     embedding,
                     searchable_only,
                     host_activity,
+                    erase_intent,
+                    erase_epoch,
                     findings,
                 ) = tokio::try_join!(
                     store.table_sizes(),
@@ -1518,6 +1538,8 @@ async fn run() -> anyhow::Result<()> {
                     embedding_fut,
                     searchable_fut,
                     hosts_fut,
+                    store.erase_intent(),
+                    store.erase_epoch_value(),
                     // A failed footer read must not take the health surface
                     // down with it; the other checks still render.
                     async { Ok(store.diagnose().await) },
@@ -1541,6 +1563,8 @@ async fn run() -> anyhow::Result<()> {
                         .or(searchable_only.map(|n| n as u64)),
                     embedding,
                     findings: &findings,
+                    erased_sessions: erase_intent.len(),
+                    erase_epoch,
                 };
                 // One scheduler probe (a launchctl/systemctl spawn) serves
                 // both the rendered line and the next-run estimate.
@@ -2005,6 +2029,11 @@ async fn run() -> anyhow::Result<()> {
             verify_only,
         } => {
             run_copy(from, to, verify_only, storage_path, config).await?;
+        }
+        Command::Erase { session_id, .. } => {
+            let loaded = Config::load(config_path(config))?;
+            let (resolved, store) = open_store(storage_path, &loaded, true, false).await?;
+            run_erase_lift(&store, &resolved.display(), &session_id).await?;
         }
         Command::Sql {
             sql,
@@ -2802,6 +2831,76 @@ fn resolve_copy_endpoint(
     sniff_copy_endpoint(raw)
 }
 
+/// `pond erase --lift`: drop one session's denylist entry on this store
+/// (spec.md#session-append-only-exception).
+async fn run_erase_lift(store: &Store, resolved: &str, session_id: &str) -> anyhow::Result<()> {
+    use pond::erase::ErasedIntent;
+    use pond::output::{dim, paint};
+    if !store.initialized().await? {
+        bail!(
+            "store {resolved} holds no sessions; check --storage-path (a mistyped path opens as an empty store)"
+        );
+    }
+    let Some(lifted) = store.lift_erase_intent(session_id).await? else {
+        bail!("session \"{session_id}\" is not denylisted on {resolved}");
+    };
+    let lifted = serde_json::from_str::<ErasedIntent>(&lifted).ok();
+    let detail = lifted
+        .as_ref()
+        .map(|intent| {
+            format!(
+                " (erased {}, root {})",
+                intent.at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                intent.root
+            )
+        })
+        .unwrap_or_default();
+    output(&format!("lifted    {session_id}{detail}"))?;
+    output_err(&paint(
+        "note      the next pond sync re-ingests this session if a source still holds it",
+        dim(),
+    ))?;
+    output_err(&paint(
+        "note      lift is per-store: a copy from a store that still holds this intent re-imports it",
+        dim(),
+    ))?;
+    let Some(lifted) = lifted else {
+        return Ok(());
+    };
+    // Erase cascades from a root, lift does not: name the siblings still held.
+    let same_root: std::collections::BTreeMap<String, String> = store
+        .erase_intent()
+        .await?
+        .into_iter()
+        .filter(|(_, value)| {
+            serde_json::from_str::<ErasedIntent>(value)
+                .is_ok_and(|intent| intent.root == lifted.root)
+        })
+        .collect();
+    let mut ids: Vec<String> = pond::erase::intent_ids(&same_root).into_iter().collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    ids.sort();
+    let count = ids.len();
+    let (noun, verb) = if count == 1 {
+        ("entry", "shares")
+    } else {
+        ("entries", "share")
+    };
+    let elided = if count > 10 { ", ..." } else { "" };
+    ids.truncate(10);
+    output_err(&paint(
+        &format!(
+            "note      {count} more {noun} {verb} root {}: {}{elided} - lift each to re-allow them",
+            lifted.root,
+            ids.join(", "),
+        ),
+        dim(),
+    ))?;
+    Ok(())
+}
+
 /// `pond copy`: move canonical data between pond stores, `.pond` archives, and
 /// the JSONL wire stream. Both endpoints are required; the verb routes on the
 /// sniffed endpoint kinds (spec.md#session-durable-copy).
@@ -2914,7 +3013,7 @@ async fn run_store_to_store_copy(
         .await?;
     if imported_intent > 0 {
         spinner.println(format!(
-            "{} {imported_intent} erased sessions denylisted on the destination",
+            "{} {imported_intent} erased sessions denylisted on the destination (pond erase --lift <id> reverses one)",
             pond::output::paint("erase:", dim),
         ));
     }
@@ -3090,7 +3189,7 @@ async fn copy_archive_to_store(path: &Path, to: StorageUrl, loaded: &Config) -> 
     let dim = pond::output::dim();
     if summary.imported_intent > 0 {
         output(&format!(
-            "{} {} erased sessions denylisted on the destination",
+            "{} {} erased sessions denylisted on the destination (pond erase --lift <id> reverses one)",
             pond::output::paint("erase:", dim),
             summary.imported_intent,
         ))?;
@@ -7307,6 +7406,16 @@ fn status_json(
     if !checks.findings.is_empty() {
         doc["maintenance"] = checks.findings.iter().map(finding_json).collect();
     }
+    if checks.erased_sessions > 0 || checks.erase_epoch.is_some() {
+        let in_flight = checks.erase_epoch.as_deref().is_some_and(|epoch| {
+            pond::erase::EraseEpoch::from_value(epoch) == pond::erase::EraseEpoch::InFlight
+        });
+        doc["erase"] = serde_json::json!({
+            "denylisted_sessions": checks.erased_sessions,
+            "epoch": checks.erase_epoch,
+            "in_flight": in_flight,
+        });
+    }
     serde_json::to_string_pretty(&doc).context("serialize status as JSON")
 }
 
@@ -7432,6 +7541,9 @@ struct StatusChecks<'a> {
     embedding: Option<EmbeddingProgress>,
     /// What `pond optimize --full` would heal (`Store::diagnose`).
     findings: &'a [MaintenanceFinding],
+    erased_sessions: usize,
+    /// The raw `pond.erase.epoch` value, `None` on a store no erase touched.
+    erase_epoch: Option<String>,
 }
 
 /// Render the checks that can take longer on a large corpus. The command
@@ -7473,6 +7585,7 @@ fn render_status_checks(checks: &StatusChecks) -> anyhow::Result<()> {
         paint("agents", dim()),
         checks.adapter_count,
     ))?;
+    render_erase_state(checks.erased_sessions, checks.erase_epoch.as_deref())?;
     render_findings(checks.findings, true)?;
     if checks.searchable.is_none() {
         let hint = if pond::embed::embeddings_enabled() {
@@ -7481,6 +7594,38 @@ fn render_status_checks(checks: &StatusChecks) -> anyhow::Result<()> {
             "(use -v for searchable message count)"
         };
         output_err(&paint(hint, dim()))?;
+    }
+    Ok(())
+}
+
+/// The erase lines of `pond status`: the denylist size and an in-flight
+/// epoch; a settled epoch is an internal token, so only the JSON carries it.
+fn render_erase_state(erased_sessions: usize, epoch: Option<&str>) -> anyhow::Result<()> {
+    use pond::erase::EraseEpoch;
+    use pond::output::{dim, paint, yellow};
+    if erased_sessions > 0 {
+        let noun = if erased_sessions == 1 {
+            "session"
+        } else {
+            "sessions"
+        };
+        output(&format!(
+            "{}    {} {noun} denylisted",
+            paint("erased", dim()),
+            format_thousands(erased_sessions as u64),
+        ))?;
+    }
+    if let Some(value) = epoch
+        && EraseEpoch::from_value(value) == EraseEpoch::InFlight
+    {
+        output(&paint(
+            &format!(
+                "warn      erase epoch in flight ({value}): row caches are disabled and every \
+                 sync re-reads its sources until the erase that set it completes - re-run \
+                 that pond erase to finish it"
+            ),
+            yellow(),
+        ))?;
     }
     Ok(())
 }

@@ -2890,19 +2890,45 @@ impl Handle {
         table: Table,
         entries: &[(String, String)],
     ) -> Result<()> {
+        self.commit_config_delta(table, |config| {
+            entries
+                .iter()
+                .filter(|(key, _)| !config.contains_key(key))
+                .map(|(key, value)| (key.clone(), Some(value.clone())))
+                .collect()
+        })
+        .await
+    }
+
+    /// Delete `key` from `table`'s config; a table without it commits nothing.
+    pub(crate) async fn remove_config_key(&self, table: Table, key: &str) -> Result<()> {
+        self.commit_config_delta(table, |config| {
+            config
+                .contains_key(key)
+                .then(|| (key.to_owned(), None))
+                .into_iter()
+                .collect()
+        })
+        .await
+    }
+
+    /// Commit the config upserts (`Some`) and deletions (`None`) `delta`
+    /// derives from the latest config, re-derived on every retry; an empty
+    /// delta commits nothing.
+    async fn commit_config_delta(
+        &self,
+        table: Table,
+        delta: impl Fn(&HashMap<String, String>) -> Vec<(String, Option<String>)>,
+    ) -> Result<()> {
         self.retry_lance(table.label(), || async {
             let mut cached = self.cached(table).await?.lock().await;
             let mut dataset = cached.latest().await?;
-            let absent: Vec<(String, String)> = entries
-                .iter()
-                .filter(|(key, _)| !dataset.config().contains_key(key))
-                .cloned()
-                .collect();
-            if absent.is_empty() {
+            let changes = delta(dataset.config());
+            if changes.is_empty() {
                 return Ok(());
             }
             dataset
-                .update_config(absent)
+                .update_config(changes)
                 .await
                 .with_context(|| format!("update_config failed for {}", table.label()))?;
             cached.replace(dataset);

@@ -113,13 +113,16 @@ impl EraseEpoch {
     /// else - `<op>:inflight`, or a form a later binary writes - reads as in
     /// flight, so an unrecognized value can never admit a stale signal.
     pub fn from_config(config: &HashMap<String, String>) -> Self {
-        match config
+        config
             .get(EPOCH_KEY)
-            .map(|value| uuid::Uuid::parse_str(value))
-        {
-            None => Self::Never,
-            Some(Ok(uuid)) => Self::Settled(*uuid.as_bytes()),
-            Some(Err(_)) => Self::InFlight,
+            .map_or(Self::Never, |value| Self::from_value(value))
+    }
+
+    /// The epoch a present config value names.
+    pub fn from_value(value: &str) -> Self {
+        match uuid::Uuid::parse_str(value) {
+            Ok(uuid) => Self::Settled(*uuid.as_bytes()),
+            Err(_) => Self::InFlight,
         }
     }
 
