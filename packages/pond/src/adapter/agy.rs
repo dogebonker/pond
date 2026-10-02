@@ -29,7 +29,6 @@
 use std::path::{Path, PathBuf};
 
 use async_stream::stream;
-use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, types::ValueRef};
 use serde_json::{Map, Value, json};
@@ -1544,18 +1543,15 @@ impl Cell {
         }
     }
 
-    /// Lossless JSON: blobs (and non-UTF-8 text) are base64 under a key that
-    /// names the encoding, so a blob can never read back as text.
     fn to_json(&self) -> Value {
-        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
-        match self {
-            Self::Null => Value::Null,
-            Self::Int(value) => json!(value),
-            Self::Real(value) => json!(value),
-            Self::Text(value) => json!(value),
-            Self::TextBytes(bytes) => json!({ "text_base64": b64(bytes) }),
-            Self::Blob(bytes) => json!({ "base64": b64(bytes) }),
-        }
+        sqlite::value_json(match self {
+            Self::Null => ValueRef::Null,
+            Self::Int(value) => ValueRef::Integer(*value),
+            Self::Real(value) => ValueRef::Real(*value),
+            Self::Text(value) => ValueRef::Text(value.as_bytes()),
+            Self::TextBytes(bytes) => ValueRef::Text(bytes),
+            Self::Blob(bytes) => ValueRef::Blob(bytes),
+        })
     }
 }
 
@@ -1858,17 +1854,24 @@ mod pb {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use std::collections::HashMap;
 
+    use base64::Engine as _;
     use tempfile::TempDir;
     use tokio_stream::StreamExt;
 
     use super::*;
     use crate::adapter::NoopOracle;
 
-    const FIXTURE_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/adapter/agy");
+    fn fixture_root() -> std::path::PathBuf {
+        crate::adapter::test_support::manifest_dir().join("tests/fixtures/adapter/agy")
+    }
 
     const CLI_NO_WORKSPACE: &str = "109948f1-ce5f-4ece-bbe0-241cdb686b57";
     const CLI_TOOLS: &str = "3f72cf51-666b-4a7c-a08f-1ade2eaafa0f";
@@ -1939,6 +1942,7 @@ mod tests {
                     run.skipped.push((session_id, reason));
                 }
                 Ok(AdapterYield::SkippedBatch { .. }) => {}
+                Ok(AdapterYield::Failed { error, .. }) => run.errors.push(error.to_string()),
                 Err(error) => run.errors.push(error.to_string()),
             }
         }
@@ -1946,7 +1950,7 @@ mod tests {
     }
 
     async fn fixture() -> Run {
-        let run = run(Path::new(FIXTURE_ROOT)).await;
+        let run = run(&fixture_root()).await;
         assert!(
             run.errors.is_empty(),
             "fixture ingest errors: {:?}",
@@ -1980,9 +1984,9 @@ mod tests {
 
     fn copy_fixture() -> TempDir {
         let temp = TempDir::new().unwrap();
-        for entry in walkdir::WalkDir::new(FIXTURE_ROOT) {
+        for entry in walkdir::WalkDir::new(fixture_root()) {
             let entry = entry.unwrap();
-            let relative = entry.path().strip_prefix(FIXTURE_ROOT).unwrap();
+            let relative = entry.path().strip_prefix(fixture_root()).unwrap();
             let target = temp.path().join(relative);
             if entry.file_type().is_dir() {
                 std::fs::create_dir_all(&target).unwrap();
@@ -2490,12 +2494,16 @@ mod tests {
                 .unwrap()
         };
         for id in [CLI_TOOLS, CLI_FORK, ACP_TOOL] {
-            let path = if id == ACP_TOOL {
-                format!("{FIXTURE_ROOT}/antigravity-acp/conversations/{id}.db")
+            let harness = if id == ACP_TOOL {
+                "antigravity-acp"
             } else {
-                format!("{FIXTURE_ROOT}/antigravity-cli/conversations/{id}.db")
+                "antigravity-cli"
             };
-            let conn = open_db(Path::new(&path)).unwrap();
+            let path = fixture_root()
+                .join(harness)
+                .join("conversations")
+                .join(format!("{id}.db"));
+            let conn = open_db(&path).unwrap();
             let source: HashMap<i64, Vec<u8>> = conn
                 .prepare("SELECT idx, step_payload FROM steps")
                 .unwrap()
@@ -2539,9 +2547,7 @@ mod tests {
     async fn the_watermark_equals_the_newest_message_so_resync_skips() {
         let run = fixture().await;
         for lane in Lane::ALL {
-            let dir = Path::new(FIXTURE_ROOT)
-                .join(lane.dir())
-                .join(CONVERSATIONS_DIR);
+            let dir = fixture_root().join(lane.dir()).join(CONVERSATIONS_DIR);
             for entry in std::fs::read_dir(&dir).unwrap() {
                 let path = entry.unwrap().path();
                 if path.extension().and_then(|ext| ext.to_str()) != Some("db") {

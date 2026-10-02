@@ -1,4 +1,4 @@
-#![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
+#![expect(clippy::print_stdout, reason = "bench harness: results go to stdout")]
 
 //! Empirically rank candidate "sync change-detection oracles" against the real
 //! S3 corpus, so the answer is measured, not guessed.
@@ -138,11 +138,12 @@ async fn run_sql(tables: &Tables, sql: &str) -> Result<usize> {
     .await
     .map_err(|err| match err {
         pond::sql::SqlError::Query(msg) => anyhow::anyhow!("query: {msg}"),
-        pond::sql::SqlError::Infra(err) => err,
+        pond::sql::SqlError::Storage(err) | pond::sql::SqlError::Infra(err) => err,
     })?;
     let count = match outcome {
         Outcome::Inline(_) => 0,
         Outcome::Export { rows, .. } => rows,
+        Outcome::Json(json) => json.row_count,
     };
     Ok(count)
 }

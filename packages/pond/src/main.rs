@@ -12,7 +12,7 @@ use std::{
 use chrono::{DateTime, Utc};
 
 use anyhow::{Context, bail};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Table, presets::NOTHING};
 use indicatif::{ProgressBar, ProgressStyle};
 use pond::{
@@ -414,6 +414,20 @@ const CONFIG_EXAMPLES_HELP_UNIX: &str = "Examples:
 const CONFIG_EXAMPLES_HELP_WINDOWS: &str = r"Examples:
   pond config show                 every setting, its value, and where it came from
   pond config schema | Out-File -Encoding utf8 $env:APPDATA\pond\config.toml   start from the annotated template";
+const SERVE_EXAMPLES_HELP: &str = if cfg!(unix) {
+    "Examples:
+  pond serve                       HTTP on 127.0.0.1:9797
+  pond serve --port 8080
+  pond serve --transport stdio     same as `pond mcp`
+  pond serve --host 0.0.0.0 --allowed-host pond.example.com   reached by name
+  pond serve --socket /run/user/1000/pond.sock   owner-only Unix socket, ready once it accepts"
+} else {
+    "Examples:
+  pond serve                       HTTP on 127.0.0.1:9797
+  pond serve --port 8080
+  pond serve --transport stdio     same as `pond mcp`
+  pond serve --host 0.0.0.0 --allowed-host pond.example.com   reached by name"
+};
 const CONFIG_EXAMPLES_HELP: &str = if cfg!(windows) {
     CONFIG_EXAMPLES_HELP_WINDOWS
 } else {
@@ -455,9 +469,6 @@ struct StoreArgs {
     state_dir: Option<PathBuf>,
 }
 
-// Parsed once, matched once, immediately destructured - the size spread
-// between variants (StorageUrl-carrying vs unit-like) has no runtime cost.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Set up pond (idempotent: safe to re-run).
@@ -750,11 +761,7 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
     /// Serves the wire protocol over HTTP on --host:--port. Most agent
     /// setups want `pond mcp` instead; `serve` is for the HTTP transport and
     /// for supervised deployments.
-    #[command(after_long_help = "Examples:
-  pond serve                       HTTP on 127.0.0.1:9797
-  pond serve --port 8080
-  pond serve --transport stdio     same as `pond mcp`
-  pond serve --host 0.0.0.0 --allowed-host pond.example.com   reached by name")]
+    #[command(after_long_help = SERVE_EXAMPLES_HELP)]
     #[command(display_order = 16)]
     Serve {
         /// Wire transport: the HTTP API, or MCP over stdio.
@@ -776,6 +783,20 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
             default_value_t = 9797
         )]
         port: u16,
+        /// Serve HTTP on a Unix socket at this path instead of --host:--port.
+        ///
+        /// The socket is owner-only (0600), so no other local user can reach
+        /// it, and a successful connect means the server is ready (the store
+        /// opens before the bind). Put it in a directory only you can write:
+        /// the mode is set by path, so a shared one lets another user swap it.
+        /// A `<path>.lock` beside it keeps a second server off the path; once
+        /// that lock is held, any socket already at the path is treated as a
+        /// dead run's and replaced, any other file is refused, and a clean
+        /// stop removes the socket. Excludes --host/--port;
+        /// POND_HOST/POND_PORT in the environment are ignored.
+        #[cfg(unix)]
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
         /// Public Host value the MCP route also accepts, on top of localhost.
         ///
         /// MCP over streamable HTTP validates the Host header against an
@@ -1086,9 +1107,6 @@ enum AdaptersCmd {
     },
 }
 
-// Parsed once, matched once, immediately destructured - the size spread
-// between variants (StorageUrl-carrying vs unit-like) has no runtime cost.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum ConfigCmd {
     /// Show the resolved configuration.
@@ -1162,7 +1180,7 @@ fn raise_lance_mem_pool() {
     }
     // Process-wide, set once at startup before tokio spawns Lance work. Safe
     // here per Rust 2024's set_var contract (no other threads reading env).
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code, reason = "set_var is unsafe in Rust 2024")]
     unsafe {
         std::env::set_var("LANCE_MEM_POOL_SIZE", "1073741824");
     }
@@ -1186,7 +1204,7 @@ fn cap_scan_io_buffer() {
     }
     // Process-wide, set once before opening the store. Safe per Rust 2024's
     // set_var contract (no other threads reading env yet).
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code, reason = "set_var is unsafe in Rust 2024")]
     unsafe {
         std::env::set_var("LANCE_DEFAULT_IO_BUFFER_SIZE", "268435456");
     }
@@ -1356,17 +1374,15 @@ fn io_trace_report(label: &str) {
 }
 
 async fn run() -> anyhow::Result<()> {
-    #[cfg(unix)]
-    #[allow(unsafe_code)]
-    unsafe {
-        // Rust ignores SIGPIPE at startup; restore the Unix default so a closed
-        // pipe exits quietly instead of panicking inside clap_complete's unwrap.
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
-
     human_panic::setup_panic!();
 
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    #[cfg(unix)]
+    if let Err(error) = reject_tcp_bind_beside_socket(&matches) {
+        error.exit();
+    }
+    let cli = Cli::from_arg_matches(&matches)
+        .unwrap_or_else(|error| error.format(&mut Cli::command()).exit());
     init_tracing(cli.verbose.tracing_level_filter());
     if let Err(error) = try_raise_fd_limit(65_536) {
         tracing::debug!("RLIMIT_NOFILE bump skipped: {error}");
@@ -1749,7 +1765,13 @@ async fn run() -> anyhow::Result<()> {
             with_sync,
             sync_every,
             bootstrap,
+            #[cfg(unix)]
+            socket,
         } => {
+            #[cfg(unix)]
+            let socket = socket
+                .map(|path| prepare_serve_socket(transport, &path))
+                .transpose()?;
             let config_file = config_path(config);
             let mut config = Config::load(&config_file)?;
             // `--bootstrap` completes before the sync loop spawns, so sync
@@ -1779,22 +1801,44 @@ async fn run() -> anyhow::Result<()> {
             // `--with-sync`: fold the periodic sync into this process, reusing
             // the store + embedder above (no separate child cold-loading a
             // second ~500 MB model). The loop logs to tracing only; stdout is
-            // the transport's.
-            if with_sync {
-                spawn_in_serve_sync(
-                    state.store.clone(),
-                    config.clone(),
-                    config_file,
-                    storage_path,
-                    Duration::from_secs(sync_every.max(1) * 60),
-                );
-            }
+            // the transport's. Started only once the listener is bound, so a
+            // server that loses its bind never writes.
+            let start_sync = {
+                let store = state.store.clone();
+                move || {
+                    if with_sync {
+                        spawn_in_serve_sync(
+                            store,
+                            config,
+                            config_file,
+                            storage_path,
+                            Duration::from_secs(sync_every.max(1) * 60),
+                        );
+                    }
+                }
+            };
             match transport {
                 ServeTransport::Http => {
-                    output(&format!("serve: http listening on http://{host}:{port}"))?;
-                    transport::http::serve(state, host, port, allowed_host).await?;
+                    #[cfg(unix)]
+                    if let Some(mut claim) = socket {
+                        let listener = claim.bind()?;
+                        start_sync();
+                        let stop = transport::http::shutdown_signal();
+                        return transport::http::serve_unix(
+                            listener,
+                            claim,
+                            state,
+                            &allowed_host,
+                            stop,
+                        )
+                        .await;
+                    }
+                    let listener = transport::http::bind(&host, port).await?;
+                    start_sync();
+                    transport::http::serve(listener, state, allowed_host).await?;
                 }
                 ServeTransport::Stdio => {
+                    start_sync();
                     eprintln!("serve: stdio MCP ready; stdout is reserved for JSON-RPC");
                     transport::mcp::serve_stdio(state).await?;
                 }
@@ -1942,12 +1986,13 @@ async fn run() -> anyhow::Result<()> {
         }
         Command::Schedule { command } => schedule::run(command, config)?,
         Command::Completions { shell } => {
-            clap_complete::generate(shell, &mut Cli::command(), "pond", &mut io::stdout());
+            // Buffered because clap_complete unwraps its writes, so a closed
+            // pipe would panic inside it instead of exiting quietly.
+            let mut script = Vec::new();
+            clap_complete::generate(shell, &mut Cli::command(), "pond", &mut script);
+            pond::output::raw(&script)?;
         }
-        Command::Skill => {
-            use std::io::Write;
-            io::stdout().write_all(include_str!("../SKILL.md").as_bytes())?;
-        }
+        Command::Skill => pond::output::raw(include_str!("../SKILL.md").as_bytes())?,
         Command::Storage { command } => run_storage_command(command, storage_path, config).await?,
         Command::Creds { command } => {
             let config_file = config_path(config);
@@ -1980,36 +2025,13 @@ async fn run() -> anyhow::Result<()> {
                 CliSqlFormat::Ndjson => pond::sql::Mode::Export(pond::sql::Format::Ndjson),
                 CliSqlFormat::Parquet => pond::sql::Mode::Export(pond::sql::Format::Parquet),
             };
-            let inline_rows = limit.min(pond::sql::MAX_INLINE_ROWS);
-            // Open only the tables the query names (spec.md#search); the slow
-            // `parts.lance` open is waste for the common messages-only query.
-            use pond::substrate::Table;
-            let (sessions, messages, parts) = tokio::try_join!(
-                async {
-                    anyhow::Ok(match pond::sql::mentions_table(&sql, "sessions") {
-                        true => Some(store.dataset(Table::Sessions).await?),
-                        false => None,
-                    })
-                },
-                async {
-                    anyhow::Ok(match pond::sql::mentions_table(&sql, "messages") {
-                        true => Some(store.dataset(Table::Messages).await?),
-                        false => None,
-                    })
-                },
-                async {
-                    anyhow::Ok(match pond::sql::mentions_table(&sql, "parts") {
-                        true => Some(store.dataset(Table::Parts).await?),
-                        false => None,
-                    })
-                },
-            )?;
-            let tables = pond::sql::Tables {
-                sessions,
-                messages,
-                parts,
-            };
-            match pond::sql::run(&tables, &sql, mode, inline_rows, Some(timeout)).await {
+            let max_rows = limit.min(pond::sql::MAX_INLINE_ROWS);
+            let outcome = async {
+                let tables = pond::sql::open_tables(&store, &sql, mode).await?;
+                pond::sql::run(&tables, &sql, mode, max_rows, Some(timeout)).await
+            }
+            .await;
+            match outcome {
                 Ok(pond::sql::Outcome::Inline(text)) => {
                     output(&text)?;
                 }
@@ -2030,11 +2052,11 @@ async fn run() -> anyhow::Result<()> {
                             path.display()
                         ))?;
                     }
-                    None => {
-                        use std::io::Write;
-                        io::stdout().write_all(&bytes)?;
-                    }
+                    None => pond::output::raw(&bytes)?,
                 },
+                Ok(pond::sql::Outcome::Json(_)) => {
+                    bail!("internal: `pond sql` never requests JSON rows");
+                }
                 Err(pond::sql::SqlError::Query(message)) => {
                     output_err(&format!(
                         "{} {}",
@@ -2043,7 +2065,7 @@ async fn run() -> anyhow::Result<()> {
                     ))?;
                     std::process::exit(2);
                 }
-                Err(pond::sql::SqlError::Infra(error)) => {
+                Err(pond::sql::SqlError::Storage(error) | pond::sql::SqlError::Infra(error)) => {
                     return Err(error);
                 }
             }
@@ -2089,7 +2111,48 @@ fn init_tracing(cli_level: tracing::level_filters::LevelFilter) {
         .init();
 }
 
-#[allow(clippy::print_stdout)]
+/// Only a `--host`/`--port` typed beside `--socket` is a conflict: the same
+/// values from POND_HOST/POND_PORT are ambient, and a supervisor spawning a
+/// socket server should not fail on whatever TCP settings it inherited.
+#[cfg(unix)]
+fn reject_tcp_bind_beside_socket(matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+    use clap::parser::ValueSource;
+
+    let Some(("serve", serve)) = matches.subcommand() else {
+        return Ok(());
+    };
+    if !serve.contains_id("socket") {
+        return Ok(());
+    }
+    for flag in ["host", "port"] {
+        if serve.value_source(flag) == Some(ValueSource::CommandLine) {
+            let kind = clap::error::ErrorKind::ArgumentConflict;
+            let message = format!(
+                "--socket replaces the TCP bind; drop --{flag} to serve on the socket, \
+                 or drop --socket to serve on --host:--port"
+            );
+            let mut cli = Cli::command();
+            cli.build();
+            return Err(match cli.find_subcommand_mut("serve") {
+                Some(serve) => serve.error(kind, message),
+                None => cli.error(kind, message),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_serve_socket(
+    transport: ServeTransport,
+    path: &Path,
+) -> anyhow::Result<transport::http::SocketClaim> {
+    if transport == ServeTransport::Stdio {
+        bail!("--socket serves HTTP; drop --socket or drop --transport stdio");
+    }
+    transport::http::SocketClaim::acquire(path)
+}
+
 fn output(message: &str) -> anyhow::Result<()> {
     pond::output::line(message)
 }
@@ -2685,9 +2748,10 @@ async fn run_storage_command(
 
 /// A `pond copy` endpoint after the suffix sniff: a pond store, a `.pond`
 /// archive, or the JSONL wire stream (a `.jsonl` file or `-` for stdio).
-// Built once, matched once, immediately consumed - the StorageUrl-vs-PathBuf
-// size spread has no runtime cost.
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "built once and consumed immediately; the size spread costs nothing"
+)]
 enum CopyEndpoint {
     Store(StorageUrl),
     Archive(PathBuf),
@@ -2974,10 +3038,13 @@ async fn copy_store_to_jsonl(
             writer.flush().await.context("copy: flush")?;
             summary
         }
-        None => {
-            let mut stdout = tokio::io::stdout();
-            handlers::pond_export(&store, None, &mut stdout).await?
-        }
+        None => handlers::pond_export(&store, None, &mut tokio::io::stdout())
+            .await
+            .inspect_err(|error| {
+                if let Some(error) = error.downcast_ref::<io::Error>() {
+                    pond::output::exit_if_broken_pipe(error);
+                }
+            })?,
     };
     let line = format!(
         "{} jsonl sessions={} messages={} parts={}",
@@ -4663,7 +4730,6 @@ async fn persist_sync_cursor(store: &Store, messages_changed: bool) {
 /// import -> openclaw deletion reconciliation -> gated optimize -> summary,
 /// routing progress + summary per `sink` (stdout HUD for the CLI, tracing for
 /// the in-serve loop). Every failure lands in the caller's last-sync record.
-#[allow(clippy::too_many_arguments)]
 async fn run_sync_pipeline(
     store: &Store,
     loaded: &Config,
@@ -6224,6 +6290,12 @@ async fn sync_with_progress(
                     dropped_count = 0;
                     optional_reason = None;
                 }
+                SyncStatus::Failed { reason } => {
+                    errors += 1;
+                    status_label = "failed";
+                    dropped_count = 0;
+                    optional_reason = Some(reason.clone());
+                }
                 SyncStatus::Partial {
                     dropped_events,
                     first_drop_reason,
@@ -6445,6 +6517,7 @@ fn format_sync_line(adapter: &str, outcome: &SessionOutcome, reason: Option<&str
 
     let (raw_tag, tag_style) = match &outcome.status {
         SyncStatus::Ok => ("ok  ", green()),
+        SyncStatus::Failed { .. } => ("fail", red()),
         SyncStatus::Partial { .. } => ("part", yellow()),
         SyncStatus::Skipped { .. } => ("skip", red()),
         SyncStatus::Rejected { .. } => ("rej ", red()),
@@ -7845,7 +7918,11 @@ fn render_error_pretty(error: &ErrorEnvelope) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use super::*;
 
@@ -7963,6 +8040,41 @@ mod tests {
         assert!(OptimizeStages::resolve(None, &[OptimizeStage::Index]).is_err());
         let full = OptimizeStages::resolve(None, &[]).unwrap();
         assert!(full.embed && full.index);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serve_socket_excludes_tcp_bind_flags_and_stdio() {
+        for tcp in [["--port", "0"], ["--host", "127.0.0.1"]] {
+            let matches = Cli::command()
+                .try_get_matches_from(
+                    ["pond", "serve", "--socket", "/tmp/pond.sock"]
+                        .into_iter()
+                        .chain(tcp),
+                )
+                .unwrap();
+            let error = reject_tcp_bind_beside_socket(&matches)
+                .expect_err("--socket replaces the TCP bind");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+            let rendered = error.to_string();
+            assert!(rendered.contains(&format!("drop {}", tcp[0])), "{rendered}");
+            assert!(rendered.contains("Usage: pond serve"), "{rendered}");
+        }
+        for args in [
+            &["pond", "serve", "--socket", "/tmp/pond.sock"][..],
+            &["pond", "serve", "--port", "0"],
+        ] {
+            let matches = Cli::command().try_get_matches_from(args).unwrap();
+            reject_tcp_bind_beside_socket(&matches).unwrap();
+        }
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("pond.sock");
+        let error = prepare_serve_socket(ServeTransport::Stdio, &path)
+            .expect_err("stdio has no socket to bind")
+            .to_string();
+        assert!(error.contains("--transport stdio"), "{error}");
+        prepare_serve_socket(ServeTransport::Http, &path).unwrap();
     }
 
     #[test]
@@ -8675,17 +8787,22 @@ mod tests {
             .render_long_help()
             .to_string()
             .replace(VERSION.as_str(), "[VERSION]");
-        insta::assert_snapshot!("help_root", root_help);
+        expect_test::expect_file!["snapshots/help_root.txt"].assert_eq(&root_help);
         let visible: Vec<String> = root
             .get_subcommands()
             .filter(|sub| !sub.is_hide_set() && sub.get_name() != "help")
             .map(|sub| sub.get_name().to_owned())
             .collect();
         for name in visible {
+            // `--socket` is unix-only, so the reviewed serve help is the unix one.
+            if cfg!(not(unix)) && name == "serve" {
+                continue;
+            }
             let sub = root
                 .find_subcommand_mut(&name)
                 .expect("visible subcommand exists");
-            insta::assert_snapshot!(format!("help_{name}"), sub.render_long_help().to_string());
+            expect_test::expect_file![format!("snapshots/help_{name}.txt")]
+                .assert_eq(&sub.render_long_help().to_string());
         }
     }
 

@@ -1,4 +1,8 @@
-#![allow(clippy::print_stdout, clippy::unwrap_used, clippy::expect_used)]
+#![expect(
+    clippy::print_stdout,
+    clippy::unwrap_used,
+    reason = "bench harness: results go to stdout, setup failures panic"
+)]
 
 //! Ingest-path microbenchmark. Drives [`ingest_adapter`] against one or more
 //! source corpora (`--adapter` picks the decoder; claude-code by default) and
@@ -141,9 +145,7 @@ fn resolve_adapter(name: &str) -> Result<&'static dyn pond::adapter::AdapterFact
 /// one line of a hand-run bench, so it omits the line instead.
 #[cfg(unix)]
 fn peak_rss_mb() -> Option<u64> {
-    // The crate denies `unsafe_code` rather than forbidding it precisely so a
-    // call like this can opt in with its reasoning stated (see `embed.rs`).
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code, reason = "getrusage FFI")]
     let usage = {
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
         // SAFETY: `getrusage` either fills the caller-owned `rusage` it is
@@ -242,7 +244,7 @@ async fn main() -> Result<()> {
                             sync_skips += 1;
                             *skip_reasons.entry(bucket_reason(reason)).or_default() += 1;
                         }
-                        SyncStatus::Rejected { reason } => {
+                        SyncStatus::Failed { reason } | SyncStatus::Rejected { reason } => {
                             sync_errors += 1;
                             *error_reasons.entry(bucket_reason(reason)).or_default() += 1;
                         }

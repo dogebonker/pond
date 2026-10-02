@@ -116,6 +116,9 @@ mod ingest_handler {
     #[derive(Debug, Clone)]
     pub enum SyncStatus {
         Ok,
+        Failed {
+            reason: String,
+        },
         Partial {
             dropped_events: usize,
             /// First drop's error message; subsequent drops counted, not
@@ -252,6 +255,20 @@ mod ingest_handler {
                 None => break,
             };
             match event {
+                Ok(AdapterYield::Failed { session_id, error }) => {
+                    summary.unreadable_events += 1;
+                    if summary.first_unreadable_reason.is_none() {
+                        summary.first_unreadable_reason = Some(error.to_string());
+                    }
+                    on_event(SyncEvent::SessionDone(SessionOutcome {
+                        project: None,
+                        session_id: Some(session_id),
+                        messages: 0,
+                        status: SyncStatus::Failed {
+                            reason: error.to_string(),
+                        },
+                    }));
+                }
                 Ok(AdapterYield::Skipped {
                     session_id,
                     project,
@@ -1076,6 +1093,74 @@ mod get_handler {
 }
 
 pub use get_handler::{pond_get_message, pond_get_session};
+
+mod sql_handler {
+    use crate::{
+        sessions::Store,
+        sql::{self, DEFAULT_INLINE_ROWS, MAX_INLINE_ROWS},
+        wire::{ErrorEnvelope, SqlEnvelope, SqlRequest, SqlResponse, validate_protocol},
+    };
+
+    use super::{map_error, map_storage};
+
+    pub async fn pond_sql(store: &Store, request: SqlRequest) -> SqlEnvelope {
+        match run(store, request).await {
+            Ok(response) => SqlEnvelope::Success(response),
+            Err(envelope) => SqlEnvelope::Error(envelope),
+        }
+    }
+
+    async fn run(store: &Store, request: SqlRequest) -> Result<SqlResponse, ErrorEnvelope> {
+        // Before any dataset open - including for a table-free `SELECT 1`.
+        validate_protocol(request.protocol_version)?;
+        super::resolve_namespace(request.namespace.as_deref())?;
+        let limit = match request.limit {
+            None => DEFAULT_INLINE_ROWS,
+            Some(limit) if (1..=MAX_INLINE_ROWS).contains(&limit) => limit,
+            Some(limit) => {
+                return Err(map_error(crate::Error::validation_field(
+                    format!("limit must be between 1 and {MAX_INLINE_ROWS}"),
+                    "limit",
+                    Some(serde_json::json!(limit)),
+                    Some(format!("1..={MAX_INLINE_ROWS}")),
+                )));
+            }
+        };
+        let outcome = async {
+            let tables = sql::open_tables(store, &request.query, sql::Mode::Json).await?;
+            sql::run(
+                &tables,
+                &request.query,
+                sql::Mode::Json,
+                limit,
+                request.timeout_seconds,
+            )
+            .await
+        }
+        .await;
+        match outcome {
+            Ok(sql::Outcome::Json(json)) => Ok(SqlResponse {
+                columns: json.columns,
+                rows: json.rows,
+                row_count: json.row_count,
+                truncated: json.truncated,
+                elapsed_ms: json.elapsed_ms,
+            }),
+            Ok(sql::Outcome::Inline(_) | sql::Outcome::Export { .. }) => Err(map_error(
+                crate::Error::Internal("sql::Mode::Json returned a non-JSON outcome".to_owned()),
+            )),
+            Err(sql::SqlError::Query(message)) => Err(map_error(crate::Error::validation_field(
+                message, "query", None, None,
+            ))),
+            Err(sql::SqlError::Storage(error)) => Err(map_storage(error)),
+            Err(sql::SqlError::Infra(error)) => {
+                Err(map_error(crate::Error::Internal(format!("{error:#}"))))
+            }
+        }
+    }
+}
+
+pub use sql_handler::pond_sql;
 
 mod search_handler {
     //! The `pond_search` handler: single-arm retrieval at message granularity -
@@ -2042,7 +2127,11 @@ mod search_handler {
 
     #[cfg(test)]
     mod grouping_helpers_tests {
-        #![allow(clippy::expect_used, clippy::unwrap_used)]
+        #![expect(
+            clippy::expect_used,
+            clippy::unwrap_used,
+            reason = "tests fail by panicking"
+        )]
 
         use super::*;
 
@@ -2122,7 +2211,7 @@ pub use search_handler::{
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(clippy::unwrap_used, reason = "tests fail by panicking")]
 
     use super::*;
     use crate::wire::{ProjectFilter, SearchFilters, SearchRequest};
@@ -2403,7 +2492,11 @@ mod tests {
 
 #[cfg(test)]
 mod get_tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "tests fail by panicking"
+    )]
 
     use crate::sessions::Store;
     use crate::wire::{

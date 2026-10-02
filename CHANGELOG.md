@@ -1,5 +1,56 @@
 # Changelog
 
+## [0.19.4](https://github.com/tenequm/pond/compare/v0.19.3...v0.19.4) - 2026-10-02
+
+### <!-- 2 -->🐛 Bug Fixes
+- **schedule:** report a systemd timer with no next elapse as broken ([#321](https://github.com/tenequm/pond/pull/321)) ([0ee290d](https://github.com/tenequm/pond/commit/0ee290dbba72dd482d324aafd2341dc7fb7909d9))
+  Linux hosts now see `pond status` report a broken schedule when the
+  systemd timer has no next elapse, instead of showing it as active with a
+  next run due. If you see it, run `pond schedule start` to repair it.
+
+  ---------
+
+
+### <!-- 5 -->📚 Documentation
+- **schedule:** trim review and incident narrative from timer comments ([#333](https://github.com/tenequm/pond/pull/333)) ([31f6f90](https://github.com/tenequm/pond/commit/31f6f90fb4b075f7694d48072cb9e7c033bcfde4))
+  Comment-polish follow-up to #321: the incident story and review
+  narration come out of the systemd timer doc comments in schedule.rs,
+  while the load-bearing WHYs (Persistent= as the cause, the timer.c
+  mechanics, why start must also check health) stay. Comment text and
+  reflow only, no behavior change.
+
+### <!-- 6 -->🧹 Chores
+- **pond:** use #[expect] with reasons for lint suppressions ([#330](https://github.com/tenequm/pond/pull/330)) ([abe68c5](https://github.com/tenequm/pond/commit/abe68c59a481896bfb33fddd8f55bb8c23db7c1a))
+- **pond:** resolve fixture and binary paths at runtime ([#327](https://github.com/tenequm/pond/pull/327)) ([6889d80](https://github.com/tenequm/pond/commit/6889d80a4b175fa50e4a73122d047880e0531794))
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.19.3...v0.19.4
+
+## [0.19.3](https://github.com/tenequm/pond/compare/v0.19.2...v0.19.3) - 2026-09-29
+
+### <!-- 1 -->🎉 New Features
+- **adapter:** add devin ([#319](https://github.com/tenequm/pond/pull/319)) ([17f2c20](https://github.com/tenequm/pond/commit/17f2c2040d9c1f90995bc4cbf5e1e48263911a75))
+  pond now ingests Devin CLI sessions (`pond adapters enable devin`) from `~/.local/share/devin/cli` or `%APPDATA%\devin\cli`, subagents included, so they outlive `devin rm`. Ingest-only: resume one elsewhere with `pond resume <id> --to claude-code`.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.19.2...v0.19.3
+
+## [0.19.2](https://github.com/tenequm/pond/compare/v0.19.1...v0.19.2) - 2026-09-25
+
+### <!-- 1 -->🎉 New Features
+- **serve:** add POST /v1/x/sql JSON endpoint and --socket ([#311](https://github.com/tenequm/pond/pull/311)) ([e21b3e6](https://github.com/tenequm/pond/commit/e21b3e6c0159d775dbf8ea10fc46feda7fbbddbf))
+  `pond serve` gains `POST /v1/x/sql` (read-only SQL returning JSON rows,
+  loopback Host only unless `--allowed-host`; `/v1/x/` routes are outside
+  the stable wire contract) and `--socket <path>` (unix), which serves on
+  an owner-only Unix socket instead of a TCP port.
+
+### <!-- 2 -->🐛 Bug Fixes
+- **serve:** survive clients that disconnect mid-response (ignore SIGPIPE) ([#316](https://github.com/tenequm/pond/pull/316)) ([692774c](https://github.com/tenequm/pond/commit/692774c930a406fc392fbb7067be0f03e5db78f1))
+  `pond serve` no longer dies when an HTTP client disconnects
+  mid-response, and commands that talk to an S3 store (sync, copy,
+  optimize, mcp) are no longer killed when the store drops a connection
+  mid-write. `pond ... | head` still exits quietly. No action needed.
+
+**Full Changelog**: https://github.com/tenequm/pond/compare/v0.19.1...v0.19.2
+
 ## [0.19.1](https://github.com/tenequm/pond/compare/v0.19.0...v0.19.1) - 2026-09-23
 
 ### <!-- 2 -->🐛 Bug Fixes

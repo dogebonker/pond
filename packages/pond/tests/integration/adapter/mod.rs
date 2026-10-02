@@ -4,7 +4,7 @@
 //! harness - the seam analog of `src/adapter/mod.rs`, which likewise carries
 //! the cross-adapter test support. Single-adapter behavior stays in its
 //! per-adapter file.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
 use std::path::Path;
 
@@ -29,6 +29,7 @@ mod agy;
 mod claude_ai_export;
 mod claude_code;
 mod codex_cli;
+mod devin;
 mod grok_build;
 mod hermes;
 mod letta_code;
@@ -550,7 +551,8 @@ async fn assert_foreign_pair(
         "foreign restore must carry every non-System message ({snapshot_name})",
     );
 
-    insta::assert_snapshot!(snapshot_name, render_files(&files));
+    expect_test::expect_file![format!("snapshots/{snapshot_name}.txt")]
+        .assert_eq(&render_files(&files));
     Ok(())
 }
 

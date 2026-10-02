@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(clippy::unwrap_used, reason = "tests fail by panicking")]
 
 //! In-place additive schema migration: a store written before the
 //! materialized tool columns (#89) upgrades on first open via the
@@ -109,7 +109,9 @@ async fn run_sql(store: &Store, sql: &str) -> anyhow::Result<String> {
     };
     match pond::sql::run(&tables, sql, pond::sql::Mode::Inline, 100, None).await {
         Ok(pond::sql::Outcome::Inline(text)) => Ok(text),
-        Ok(pond::sql::Outcome::Export { .. }) => anyhow::bail!("unexpected export outcome"),
+        Ok(pond::sql::Outcome::Export { .. } | pond::sql::Outcome::Json(_)) => {
+            anyhow::bail!("unexpected non-inline outcome")
+        }
         Err(error) => anyhow::bail!("sql failed: {error:?}"),
     }
 }

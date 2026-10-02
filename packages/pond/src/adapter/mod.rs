@@ -31,6 +31,7 @@ mod claude_ai_export;
 mod claude_code;
 mod claude_desktop_app;
 mod codex_cli;
+mod devin;
 mod discovery;
 pub mod extract;
 mod grok_build;
@@ -49,6 +50,7 @@ pub use claude_ai_export::{ClaudeAiExportAdapter, ClaudeAiExportFactory};
 pub use claude_code::{ClaudeCodeAdapter, ClaudeCodeFactory};
 pub use claude_desktop_app::{ClaudeDesktopAppAdapter, ClaudeDesktopAppFactory};
 pub use codex_cli::{CodexCliAdapter, CodexCliFactory};
+pub use devin::{DevinAdapter, DevinFactory};
 pub use discovery::{
     Candidate, apply_to_doc, discover, persist_accept, probe_pathless, probe_unconfigured,
     prompt_and_persist, set_adapter_enabled,
@@ -157,6 +159,7 @@ pub trait Adapter: Send + Sync {
         Box::pin(stream.filter_map(|res| match res {
             Ok(AdapterYield::Event(event)) => Some(Ok(event)),
             Ok(AdapterYield::Skipped { .. } | AdapterYield::SkippedBatch { .. }) => None,
+            Ok(AdapterYield::Failed { error, .. }) => Some(Err(error)),
             Err(error) => Some(Err(error)),
         }))
     }
@@ -328,9 +331,13 @@ impl SkipOracle for NoopOracle {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum AdapterYield {
     Event(IngestEvent),
+    Failed {
+        session_id: String,
+        error: AdapterError,
+    },
     Skipped {
         /// `None` for files that never yield a session id (empty `.jsonl`).
         session_id: Option<String>,
@@ -546,6 +553,7 @@ pub fn registry() -> &'static [&'static dyn AdapterFactory] {
         &LettaCodeFactory,
         &GrokBuildFactory,
         &AgyFactory,
+        &DevinFactory,
     ]
 }
 
@@ -902,9 +910,7 @@ pub(crate) fn empty_options() -> ProviderOptions {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
-
-    use std::path::{Path, PathBuf};
+    #![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
     use tempfile::TempDir;
 
@@ -1082,16 +1088,6 @@ mod tests {
             "macro_rules!",
         ];
 
-        fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-            for entry in std::fs::read_dir(dir).expect("adapter dir is readable") {
-                let path = entry.expect("dir entry").path();
-                if path.is_dir() {
-                    rust_files(&path, out);
-                } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
-                    out.push(path);
-                }
-            }
-        }
         fn identifiers(text: &str) -> impl Iterator<Item = &str> {
             text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                 .filter(|ident| !ident.is_empty())
@@ -1204,11 +1200,11 @@ mod tests {
                 && !line.split_whitespace().take(4).any(|word| word == "mod")
         }
 
-        let adapter_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let adapter_dir = super::test_support::manifest_dir()
             .join("src")
             .join("adapter");
         let mut files = Vec::new();
-        rust_files(&adapter_dir, &mut files);
+        super::test_support::rust_files(&adapter_dir, &mut files);
         files.sort();
         let mut violations = Vec::new();
         let mut exempt_hits: Vec<usize> = vec![0; EXEMPT.len()];
@@ -1337,6 +1333,25 @@ pub(crate) mod test_support {
 
     use super::{Adapter, AdapterFactory, Env, NoopOracle, RestoreFidelity, SkipOracle};
     use crate::{handlers::ingest_adapter, sessions::Store};
+
+    /// Read at runtime: compile-time `env!` would bake the checkout path into
+    /// the test binary and defeat cross-worktree compiler caching.
+    #[expect(clippy::expect_used, reason = "test helpers fail by panicking")]
+    pub(crate) fn manifest_dir() -> PathBuf {
+        PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("run tests via cargo"))
+    }
+
+    #[expect(clippy::expect_used, reason = "test helpers fail by panicking")]
+    pub(crate) fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("source dir is readable") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
 
     /// Oracle that makes every session gate as fresh.
     pub(crate) struct MaxWatermarkOracle;

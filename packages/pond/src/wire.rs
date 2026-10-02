@@ -309,10 +309,10 @@ pub struct ErrorEnvelope {
     pub error: ErrorBody,
 }
 
-// The success/error size gap is fine here: a `GetEnvelope` is one per-request
-// return value, serialized immediately - never stored in bulk where the gap
-// would waste memory.
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per request and serialized immediately, never stored in bulk"
+)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum GetEnvelope {
@@ -688,6 +688,55 @@ pub struct SearchResult {
     pub parts_summary: Vec<PartSummary>,
 }
 
+/// `POST /v1/x/sql` (spec.md#protocol): read-only SQL with JSON rows. The
+/// `/v1/x/` prefix puts it outside the additive wire contract - the request is
+/// versioned, but result columns follow the storage schema, which is not.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SqlRequest {
+    pub protocol_version: u16,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// One read-only SELECT/WITH (or EXPLAIN of one).
+    #[serde(alias = "sql")]
+    pub query: String,
+    /// Row cap on the response: default [`DEFAULT_INLINE_ROWS`], at most
+    /// [`MAX_INLINE_ROWS`].
+    ///
+    /// [`DEFAULT_INLINE_ROWS`]: crate::sql::DEFAULT_INLINE_ROWS
+    /// [`MAX_INLINE_ROWS`]: crate::sql::MAX_INLINE_ROWS
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Execution timeout in seconds: default [`DEFAULT_QUERY_TIMEOUT_SECS`],
+    /// clamped to [`MAX_QUERY_TIMEOUT_SECS`].
+    ///
+    /// [`DEFAULT_QUERY_TIMEOUT_SECS`]: crate::sql::DEFAULT_QUERY_TIMEOUT_SECS
+    /// [`MAX_QUERY_TIMEOUT_SECS`]: crate::sql::MAX_QUERY_TIMEOUT_SECS
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+}
+
+/// One JSON object per row keyed by column name, NULL fields omitted, and
+/// timestamps as RFC3339 UTC with exactly six fractional digits (lossless
+/// keyset cursors). `columns` names every result column even when `rows` is
+/// empty. `row_count` counts the returned rows and `truncated` is true iff the
+/// row cap or the response byte budget cut the result - never whether the
+/// query's own `LIMIT` did; the budget always admits the first row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SqlResponse {
+    pub columns: Vec<String>,
+    pub rows: Vec<Value>,
+    pub row_count: usize,
+    pub truncated: bool,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SqlEnvelope {
+    Success(SqlResponse),
+    Error(ErrorEnvelope),
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum IngestEnvelope {
@@ -877,7 +926,7 @@ pub fn storage_error(error_value: anyhow::Error) -> ErrorEnvelope {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![expect(clippy::expect_used, reason = "tests fail by panicking")]
 
     use super::*;
     use serde_json::json;
