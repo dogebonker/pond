@@ -1,5 +1,5 @@
-//! Every herdr CLI call (`pane list`, `agent focus`, `plugin pane open|focus`,
-//! `notification show`) and the plugin runtime env.
+//! Every herdr CLI call (`pane list|close`, `tab create`, `agent focus|start`,
+//! `plugin pane open|focus`, `notification show`) and the plugin runtime env.
 
 use std::fs;
 use std::io::Read;
@@ -20,6 +20,8 @@ const DESK_ENTRYPOINT: &str = "desk";
 const DESK_LABEL: &str = "pond desk";
 /// herdr answers in milliseconds; a hung CLI must not hang a hook or the desk.
 const CALL_DEADLINE: Duration = Duration::from_secs(3);
+/// `agent start` waits for the agent to be ready, up to herdr's own 30s default.
+const AGENT_START_DEADLINE: Duration = Duration::from_secs(35);
 const CALL_POLL: Duration = Duration::from_millis(5);
 
 /// A plugin-runtime path herdr sets for every plugin process.
@@ -45,6 +47,19 @@ pub(crate) fn socket_path() -> anyhow::Result<PathBuf> {
 /// The desk's project: the underlying pane's cwd, else the workspace's.
 pub(crate) fn context_project() -> Option<String> {
     project_from_context(&std::env::var("HERDR_PLUGIN_CONTEXT_JSON").ok()?)
+}
+
+/// The pane an action was invoked on.
+pub(crate) fn context_pane() -> Option<String> {
+    #[derive(Deserialize)]
+    struct Context {
+        focused_pane_id: Option<String>,
+    }
+    let json = std::env::var("HERDR_PLUGIN_CONTEXT_JSON").ok()?;
+    serde_json::from_str::<Context>(&json)
+        .ok()?
+        .focused_pane_id
+        .filter(|id| !id.is_empty())
 }
 
 fn project_from_context(json: &str) -> Option<String> {
@@ -105,6 +120,10 @@ pub(crate) struct Pane {
     pub pane_id: String,
     #[serde(default)]
     pub label: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub agent_status: Option<String>,
     #[serde(default)]
     pub agent_session: Option<AgentSession>,
 }
@@ -211,6 +230,48 @@ impl Herdr {
 
     pub(crate) fn agent_focus(&self, pane_id: &str) -> anyhow::Result<()> {
         self.call(&["agent", "focus", pane_id]).map(drop)
+    }
+
+    pub(crate) fn pane_close(&self, pane_id: &str) -> anyhow::Result<()> {
+        self.call(&["pane", "close", pane_id]).map(drop)
+    }
+
+    /// Opens a focused tab and returns its root pane.
+    pub(crate) fn tab_create(
+        &self,
+        workspace: Option<&str>,
+        cwd: &str,
+        label: &str,
+    ) -> anyhow::Result<String> {
+        let mut args = vec!["tab", "create", "--cwd", cwd, "--label", label, "--focus"];
+        if let Some(workspace) = workspace {
+            args.extend(["--workspace", workspace]);
+        }
+        let result = self.call(&args)?;
+        result["root_pane"]["pane_id"]
+            .as_str()
+            .map(str::to_owned)
+            .context("herdr tab create: no root pane in the response")
+    }
+
+    /// Starts `kind` in `pane_id` and waits until herdr detects it ready.
+    pub(crate) fn agent_start(
+        &self,
+        name: &str,
+        kind: &str,
+        pane_id: &str,
+        agent_args: &[String],
+    ) -> anyhow::Result<()> {
+        let mut args = vec![
+            "agent", "start", name, "--kind", kind, "--pane", pane_id, "--",
+        ];
+        args.extend(agent_args.iter().map(String::as_str));
+        Self {
+            deadline: AGENT_START_DEADLINE,
+            ..self.clone()
+        }
+        .call(&args)
+        .map(drop)
     }
 
     pub(crate) fn notify(&self, title: &str, body: &str) -> anyhow::Result<()> {

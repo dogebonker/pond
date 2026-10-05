@@ -85,7 +85,10 @@ fn idle_adapter(event_json: &str) -> Option<&'static str> {
     if !matches!(data.agent_status.as_deref(), Some("idle" | "done")) {
         return None;
     }
-    let agent = data.agent?;
+    adapter_for(&data.agent?)
+}
+
+pub(crate) fn adapter_for(agent: &str) -> Option<&'static str> {
     ADAPTERS
         .iter()
         .find(|(name, _)| *name == agent)

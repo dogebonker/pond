@@ -112,9 +112,43 @@ pub(super) fn render(frame: &mut Frame, app: &mut App) {
     } else {
         render_desk(frame, app);
     }
+    if let Some(handoff) = &app.handoff {
+        render_handoff(frame, &handoff.targets, handoff.selected);
+    }
     if let Some(toast) = &app.toast {
         render_toast(frame, toast);
     }
+}
+
+fn render_handoff(frame: &mut Frame, targets: &[&str], selected: usize) {
+    let area = frame.area();
+    let width = area.width.min(40);
+    let height = u16::try_from(targets.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .min(area.height);
+    let picker = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let lines: Vec<Line> = targets
+        .iter()
+        .enumerate()
+        .map(|(index, target)| {
+            if index == selected {
+                Line::from(format!("> {target}")).reversed()
+            } else {
+                Line::from(format!("  {target}"))
+            }
+        })
+        .collect();
+    frame.render_widget(Clear, picker);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" hand off to - enter / esc ")),
+        picker,
+    );
 }
 
 fn render_fatal(frame: &mut Frame, message: &str) {
@@ -425,11 +459,13 @@ fn footer(app: &App) -> Line<'static> {
         "enter done  esc clear  up/down select".to_owned()
     } else if app.search.is_some() {
         format!(
-            "/ edit  esc back  enter open  space preview  p project/everything  \
-             t {LISTING_WINDOW_DAYS} days/any  q quit"
+            "/ edit  esc back  enter open  o resume  f fork  h hand off  space preview  \
+             p project/everything  t {LISTING_WINDOW_DAYS} days/any  q quit"
         )
     } else {
-        "/ search  enter open  space preview  p projects  t time  r refresh  q quit".to_owned()
+        "/ search  enter open  o resume  f fork  h hand off  space preview  p projects  t time  \
+         r refresh  q quit"
+            .to_owned()
     };
     let mut spans = Vec::new();
     if app.spinner_visible() {
@@ -491,7 +527,7 @@ fn render_pager(frame: &mut Frame, app: &App) {
         Paragraph::new(Line::from(vec![
             Span::raw(PAGER_FOOTER).dim(),
             Span::raw(format!(
-                " | {status} | line {}/{} | q back",
+                " | {status} | line {}/{} | o resume  f fork  h hand off  q back",
                 (pager.offset + 1).min(pager.lines.len()),
                 pager.lines.len()
             )),
