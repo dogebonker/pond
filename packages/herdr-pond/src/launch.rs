@@ -145,7 +145,10 @@ fn launch_with(
     } else {
         client.resume
     };
+    refuse_flag_shaped(&launch.session_id)?;
     let resumed = resume(pond, &launch.session_id, client.adapter)?;
+    refuse_flag_shaped(&resumed.session_id)?;
+    refuse_flag_shaped(&resumed.path)?;
     let args: Vec<String> = template
         .iter()
         .map(|arg| {
@@ -164,6 +167,16 @@ fn launch_with(
     let label = format!("{} {verb} {short_id}", client.kind);
     let pane = herdr.tab_create(workspace, &cwd, &label)?;
     herdr.agent_start(&label, client.kind, &pane, &args)
+}
+
+/// Session ids come from source files, possibly another machine's, and land
+/// on a client's argv: one starting with `-` would parse as a flag (claude's
+/// `--resume` takes an optional value).
+fn refuse_flag_shaped(value: &str) -> anyhow::Result<()> {
+    if value.starts_with('-') {
+        bail!("refusing to pass {value:?} to a client: it would parse as a flag");
+    }
+    Ok(())
 }
 
 struct Resumed {
@@ -485,6 +498,41 @@ esac"#,
             "{error}"
         );
         assert!(sandbox.lines("pond-calls").is_empty());
+    }
+
+    #[test]
+    fn a_flag_shaped_session_id_never_reaches_a_client() {
+        let sandbox = Sandbox::new();
+        let pond = fake_pond(&sandbox, "{}", 0);
+        let herdr = fake_herdr(&sandbox);
+        let flag = "--dangerously-skip-permissions";
+        let error = launch_with(
+            &launch(flag, "claude-code", false),
+            &pond,
+            &herdr,
+            None,
+            "/",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("parse as a flag"), "{error}");
+        assert!(sandbox.lines("pond-calls").is_empty());
+
+        let pond = fake_pond(
+            &sandbox,
+            &format!(r#"{{"sessions":[{{"session_id":"{flag}","files":["/c/x.jsonl"]}}]}}"#),
+            0,
+        );
+        assert!(
+            launch_with(
+                &launch("s1", "claude-code", false),
+                &pond,
+                &herdr,
+                None,
+                "/"
+            )
+            .is_err()
+        );
+        assert!(sandbox.lines("herdr-calls").is_empty());
     }
 
     fn pane(agent: Option<&str>, status: &str) -> herdr::Pane {
