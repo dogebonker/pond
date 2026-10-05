@@ -86,6 +86,11 @@ impl AdapterFactory for ClaudeCodeFactory {
         path.exists().then(|| json!({ "path": path }))
     }
 
+    /// Restored paths start at the encoded project dir, the source root's child.
+    fn native_restore_root(&self, source_path: &Path) -> Option<PathBuf> {
+        Some(source_path.to_path_buf())
+    }
+
     fn serialize(
         &self,
         session: &crate::sessions::SessionWithMessages,

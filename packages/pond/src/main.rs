@@ -738,9 +738,12 @@ enum Command {
     #[command(after_long_help = "Examples:
   pond resume 019dd55d-99a4-7344-aa11-d1d71d2c80fb --to pi-coding-agent --out-dir ~/.pi/agent
   pond resume <id> --to claude-code --format json     machine-readable file list
+  pond resume <id> --to claude-code --out-dir native   into ~/.claude/projects, ready for claude --resume
 
 --out-dir is the directory the adapter's own layout is rooted at, so for
-pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
+pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.
+--out-dir native picks that directory for you, from the adapter's configured
+path (claude-code, codex-cli, pi-coding-agent).")]
     #[command(display_order = 14)]
     Resume {
         /// Session id (from `pond search`).
@@ -749,7 +752,8 @@ pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.")]
         /// Target client (pi-coding-agent, claude-code, codex-cli, ...).
         #[arg(long = "to", value_name = "ADAPTER")]
         to: String,
-        /// Root the written files are placed under. Default: the current directory.
+        /// Root the written files are placed under, or `native` for the
+        /// client's own session directory. Default: the current directory.
         #[arg(long, default_value = ".")]
         out_dir: PathBuf,
         /// Output format: `text` (one line per session) or `json` (one document).
@@ -2211,13 +2215,30 @@ async fn run_resume(
     }
 
     let loaded = Config::load(config_path(config))?;
+    let out_dir = if out_dir == Path::new("native") {
+        match native_out_dir(factory, &loaded) {
+            Some(dir) => dir,
+            None => {
+                return fail(
+                    2,
+                    serde_json::json!({"error": "no_native_dir", "adapter": to}),
+                    format!(
+                        "no native session directory for {to} on this machine - \
+                         pass --out-dir <dir> instead",
+                    ),
+                );
+            }
+        }
+    } else {
+        out_dir.to_path_buf()
+    };
     let (_, store) = open_store(storage_path, &loaded, false, false).await?;
 
     // The reported paths are absolute even when `--out-dir` is relative (it
     // defaults to `.`): a plugin hands them straight to its own client, which
     // resolves them against ITS cwd, not pond's. `absolute` is purely lexical,
     // so it works before the directory exists.
-    let out_dir = std::path::absolute(out_dir).unwrap_or_else(|_| out_dir.to_path_buf());
+    let out_dir = std::path::absolute(&out_dir).unwrap_or(out_dir);
     let out_dir = out_dir.as_path();
 
     // spec.md#adapter-lineage-complete-restore: a session restores together
@@ -2250,6 +2271,11 @@ async fn run_resume(
     // Fidelity is the system's decision, never the caller's: same origin means
     // a value-complete replay is available (`source_agent` is exact-or-subpath,
     // so a subagent of the target client counts as native).
+    // The requested session's own project: a caller launching the client on
+    // the resumed files runs it there.
+    let project = sessions
+        .first()
+        .map(|session| session.session.project.clone());
     let mut planned = Vec::with_capacity(sessions.len());
     for session in &sessions {
         let files = factory.serialize(
@@ -2285,7 +2311,7 @@ async fn run_resume(
         }
         fail(
             3,
-            serde_json::json!({"error": "already_exists", "session_id": session_id, "existing": existing}),
+            serde_json::json!({"error": "already_exists", "session_id": session_id, "project": project, "existing": existing}),
             format!(
                 "already resumed - refusing to overwrite:\n  {}",
                 existing.join("\n  "),
@@ -2377,6 +2403,7 @@ async fn run_resume(
         output(&serde_json::to_string_pretty(&serde_json::json!({
             "adapter": to,
             "out_dir": out_dir.display().to_string(),
+            "project": project,
             "sessions": report,
         }))?)?;
         return Ok(());
@@ -2394,6 +2421,24 @@ async fn run_resume(
         }
     }
     Ok(())
+}
+
+/// `pond resume --out-dir native`: the adapter's configured source `path`, else
+/// the one its probe finds, mapped to where its restored layout is rooted. A
+/// multi-path config has no single answer, so it resolves to `None`.
+fn native_out_dir(factory: &dyn adapter::AdapterFactory, loaded: &Config) -> Option<PathBuf> {
+    let configured = loaded
+        .adapters
+        .get(factory.name())
+        .and_then(|blob| blob.get("path"));
+    let source = match configured {
+        Some(path) => PathBuf::from(path.as_str()?),
+        None => {
+            let probed = factory.probe_default(&adapter::Env::from_env()?)?;
+            PathBuf::from(probed.get("path")?.as_str()?)
+        }
+    };
+    factory.native_restore_root(&adapter::expand_home(source))
 }
 
 /// Did this session come from the adapter being resumed into? The same

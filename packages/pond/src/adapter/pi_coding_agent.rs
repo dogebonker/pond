@@ -115,6 +115,11 @@ impl AdapterFactory for PiCodingAgentFactory {
         path.exists().then(|| json!({ "path": path }))
     }
 
+    /// Restored paths carry the `sessions/` segment, so they root one level up.
+    fn native_restore_root(&self, source_path: &Path) -> Option<PathBuf> {
+        source_path.parent().map(Path::to_path_buf)
+    }
+
     fn serialize(
         &self,
         session: &crate::sessions::SessionWithMessages,

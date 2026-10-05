@@ -273,6 +273,45 @@ async fn native_resume_writes_a_pi_session_file_for_the_whole_lineage() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn native_resolves_the_clients_own_directory_and_reports_the_project() {
+    let sandbox = Sandbox::with_pi_corpus().await;
+    let sessions = sandbox.temp.path().join("home/.pi/agent/sessions");
+    std::fs::create_dir_all(&sessions).expect("a pi install");
+    let args = [
+        PI_SESSION,
+        "--to",
+        "pi-coding-agent",
+        "--out-dir",
+        "native",
+        "--format",
+        "json",
+    ];
+
+    let (code, doc) = sandbox.resume_json(&args);
+    assert_eq!(code, 0, "{doc}");
+    assert!(doc["project"].is_string(), "{doc}");
+    for file in files_of(&doc, PI_SESSION) {
+        assert!(Path::new(&file).starts_with(&sessions), "{file}");
+    }
+
+    let (again, refusal) = sandbox.resume_json(&args);
+    assert_eq!(again, 3, "{refusal}");
+    assert_eq!(refusal["project"], doc["project"]);
+
+    let (code, missing) = sandbox.resume_json(&[
+        PI_SESSION,
+        "--to",
+        "codex-cli",
+        "--out-dir",
+        "native",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code, 2, "{missing}");
+    assert_eq!(missing["error"], "no_native_dir");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn resuming_twice_is_refused_and_names_what_is_already_there() {
     let sandbox = Sandbox::with_pi_corpus().await;
     let out_dir = sandbox.out_dir();
