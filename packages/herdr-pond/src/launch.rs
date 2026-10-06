@@ -166,7 +166,22 @@ fn launch_with(
     let short_id: String = launch.session_id.chars().take(8).collect();
     let label = format!("{} {verb} {short_id}", client.kind);
     let pane = herdr.tab_create(workspace, &cwd, &label)?;
-    herdr.agent_start(&label, client.kind, &pane, &args)
+    herdr.agent_start(
+        &agent_name(client.kind, verb, &short_id),
+        client.kind,
+        &pane,
+        &args,
+    )
+}
+
+/// herdr agent names are `[a-z][a-z0-9_-]{0,31}`.
+fn agent_name(kind: &str, verb: &str, short_id: &str) -> String {
+    let id: String = short_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    format!("{kind}-{verb}-{id}")
 }
 
 /// Session ids come from source files, possibly another machine's, and land
@@ -428,7 +443,7 @@ esac"#,
                     "tab create --cwd {} --label claude resume abc12345 --focus --workspace wD",
                     project.display()
                 ),
-                "agent start claude resume abc12345 --kind claude --pane wD:p9 -- --resume abc12345-x"
+                "agent start claude-resume-abc12345 --kind claude --pane wD:p9 -- --resume abc12345-x"
                     .to_owned(),
             ]
         );
@@ -456,7 +471,8 @@ esac"#,
             "{calls:?}"
         );
         assert!(
-            calls[1].ends_with("--kind pi --pane wD:p9 -- --fork /pi/sessions/s/f.jsonl"),
+            calls[1]
+                == "agent start pi-fork-s1 --kind pi --pane wD:p9 -- --fork /pi/sessions/s/f.jsonl",
             "{calls:?}"
         );
     }

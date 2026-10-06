@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -78,10 +79,13 @@ fn project_from_context(json: &str) -> Option<String> {
 /// Spawns `command` so it holds no herdr command slot: herdr reads a plugin
 /// command's stdout/stderr to EOF before releasing its slot, so every stdio
 /// end goes to /dev/null or `log`. The child calls [`detach`] itself - a
-/// pre-exec `setsid` would need `unsafe`.
+/// pre-exec `setsid` would need `unsafe` - so it starts in its own process
+/// group: the desk spawns it as its pane closes, and the pane's teardown
+/// signals the desk's group before the child has detached.
 pub(crate) fn spawn_detached(mut command: Command, log: &Path) -> anyhow::Result<()> {
     log_stdio(&mut command, log)
         .with_context(|| format!("opening {}", log.display()))?
+        .process_group(0)
         .spawn()
         .with_context(|| format!("spawning {:?}", command.get_program()))?;
     Ok(())
