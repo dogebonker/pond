@@ -14,7 +14,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::cache::{Known, SavedListing, Snapshot};
 use super::ui;
-use crate::launch::{self, Launch};
+use crate::launch::{self, Launch, Mode};
 use crate::types::{
     ApiError, Cursor, DeskContext, DeskExit, LISTING_ROWS, ListingScope, LiveAgent, PAGE_ROWS,
     SearchRequest, SearchResponse, SessionHost, SessionRow, SessionStart, SessionStats,
@@ -221,14 +221,7 @@ pub(super) struct Search {
 pub(super) struct Handoff {
     session_id: String,
     pub(super) targets: Vec<&'static str>,
-    pub(super) selected: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Action {
-    Resume,
-    Fork,
-    HandOff,
+    pub(super) state: ListState,
 }
 
 /// The transcript, wrapped once per load or resize so a frame only slices it.
@@ -669,9 +662,9 @@ impl App {
             KeyCode::Char('p') => self.toggle_scope(true),
             KeyCode::Char('t') => self.toggle_scope(false),
             KeyCode::Char('r') => self.refresh(),
-            KeyCode::Char('o') => self.act(Action::Resume),
-            KeyCode::Char('f') => self.act(Action::Fork),
-            KeyCode::Char('h') => self.act(Action::HandOff),
+            KeyCode::Char('o') => self.act(Mode::Resume),
+            KeyCode::Char('f') => self.act(Mode::Fork),
+            KeyCode::Char('h') => self.act(Mode::HandOff),
             _ => Vec::new(),
         }
     }
@@ -731,9 +724,9 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace | KeyCode::Left => {
                 return self.close_pager();
             }
-            KeyCode::Char('o') => return self.act(Action::Resume),
-            KeyCode::Char('f') => return self.act(Action::Fork),
-            KeyCode::Char('h') => return self.act(Action::HandOff),
+            KeyCode::Char('o') => return self.act(Mode::Resume),
+            KeyCode::Char('f') => return self.act(Mode::Fork),
+            KeyCode::Char('h') => return self.act(Mode::HandOff),
             KeyCode::Down | KeyCode::Char('j') => 1,
             KeyCode::Up | KeyCode::Char('k') => -1,
             KeyCode::PageDown | KeyCode::Char(' ') => page,
@@ -956,31 +949,41 @@ impl App {
         effects
     }
 
-    /// The selected session (the pager's, while it is open) and its client.
-    fn selected_session(&self) -> Option<(String, String)> {
-        let index = self.selected_index()?;
-        let (id, agent) = match &self.search {
-            Some(search) => search
-                .response
-                .as_ref()?
-                .sessions
-                .get(index)
-                .map(|s| (&s.session_id, &s.source_agent))?,
-            None => self
-                .listing()?
-                .get(index)
-                .map(|row| (&row.session_id, &row.source_agent))?,
+    /// The session `o`/`f`/`h` act on - the pager's while it is open, since a
+    /// refresh can move the list selection under it - and its client.
+    fn acted_session(&self) -> Option<(String, String)> {
+        let id = match &self.pager {
+            Some(pager) => pager.session_id.clone(),
+            None => self.selected_id()?.to_owned(),
         };
-        Some((id.clone(), agent.clone()))
+        let searched = self
+            .search
+            .as_ref()
+            .and_then(|search| search.response.as_ref())
+            .into_iter()
+            .flat_map(|response| &response.sessions)
+            .map(|session| (&session.session_id, &session.source_agent));
+        let listed = self
+            .listing()
+            .into_iter()
+            .flatten()
+            .map(|row| (&row.session_id, &row.source_agent));
+        let agent = searched
+            .chain(listed)
+            .find(|(found, _)| **found == id)?
+            .1
+            .clone();
+        Some((id, agent))
     }
 
-    /// `o` on a live row jumps to it, as enter does; every other action leaves
-    /// the desk so the launch runs after the terminal is restored.
-    fn act(&mut self, action: Action) -> Vec<Effect> {
-        let Some((session_id, source_agent)) = self.selected_session() else {
+    /// `o` on a live row jumps to it, as enter does, and `h` first asks for a
+    /// target; a launch leaves the desk so it runs after the terminal is
+    /// restored.
+    fn act(&mut self, mode: Mode) -> Vec<Effect> {
+        let Some((session_id, source_agent)) = self.acted_session() else {
             return Vec::new();
         };
-        if action == Action::Resume
+        if mode == Mode::Resume
             && let Some(agent) = self.live_agent(&session_id)
         {
             return vec![Effect::Exit(DeskExit::Jump {
@@ -988,7 +991,7 @@ impl App {
             })];
         }
         let own = launch::client(&source_agent);
-        if action == Action::HandOff {
+        if mode == Mode::HandOff {
             let targets: Vec<&'static str> = launch::CLIENTS
                 .iter()
                 .map(|client| client.adapter)
@@ -997,7 +1000,7 @@ impl App {
             self.handoff = Some(Handoff {
                 session_id,
                 targets,
-                selected: 0,
+                state: ListState::default().with_selected(Some(0)),
             });
             return Vec::new();
         }
@@ -1007,15 +1010,10 @@ impl App {
             ));
             return Vec::new();
         };
-        let fork = action == Action::Fork;
-        if fork && !client.can_fork() {
-            self.toast = Some(format!("{} has no native fork", client.adapter));
-            return Vec::new();
-        }
         vec![Effect::Exit(DeskExit::Launch(Launch {
             session_id,
             adapter: client.adapter.to_owned(),
-            fork,
+            mode,
         }))]
     }
 
@@ -1023,24 +1021,25 @@ impl App {
         let Some(handoff) = &mut self.handoff else {
             return Vec::new();
         };
+        let selected = handoff.state.selected().unwrap_or(0);
         let last = handoff.targets.len().saturating_sub(1);
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.handoff = None,
             KeyCode::Down | KeyCode::Char('j') => {
-                handoff.selected = (handoff.selected + 1).min(last);
+                handoff.state.select(Some((selected + 1).min(last)));
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                handoff.selected = handoff.selected.saturating_sub(1);
+                handoff.state.select(Some(selected.saturating_sub(1)));
             }
             KeyCode::Enter => {
                 let Some(handoff) = self.handoff.take() else {
                     return Vec::new();
                 };
-                if let Some(target) = handoff.targets.get(handoff.selected) {
+                if let Some(target) = handoff.targets.get(selected) {
                     return vec![Effect::Exit(DeskExit::Launch(Launch {
                         session_id: handoff.session_id,
                         adapter: (*target).to_owned(),
-                        fork: false,
+                        mode: Mode::HandOff,
                     }))];
                 }
             }
@@ -2201,11 +2200,11 @@ mod tests {
         assert!(app.pager.is_none());
     }
 
-    fn launched(id: &str, adapter: &str, fork: bool) -> Option<DeskExit> {
+    fn launched(id: &str, adapter: &str, mode: Mode) -> Option<DeskExit> {
         Some(DeskExit::Launch(Launch {
             session_id: id.to_owned(),
             adapter: adapter.to_owned(),
-            fork,
+            mode,
         }))
     }
 
@@ -2219,12 +2218,12 @@ mod tests {
         assert_eq!(press(&mut app, &api, KeyCode::Char('o')), live);
         assert_eq!(
             press(&mut app, &api, KeyCode::Char('f')),
-            launched("s-live", "claude-code", true)
+            launched("s-live", "claude-code", Mode::Fork)
         );
         press(&mut app, &api, KeyCode::Down);
         assert_eq!(
             press(&mut app, &api, KeyCode::Char('o')),
-            launched("s-old", "codex-cli", false)
+            launched("s-old", "codex-cli", Mode::Resume)
         );
 
         assert_eq!(press(&mut app, &api, KeyCode::Char('h')), None);
@@ -2239,14 +2238,30 @@ mod tests {
         press(&mut app, &api, KeyCode::Down);
         assert_eq!(
             press(&mut app, &api, KeyCode::Enter),
-            launched("s-old", "pi-coding-agent", false)
+            launched("s-old", "pi-coding-agent", Mode::HandOff)
         );
 
         assert_eq!(press(&mut app, &api, KeyCode::Enter), None);
         assert!(app.pager.is_some());
         assert_eq!(
             press(&mut app, &api, KeyCode::Char('f')),
-            launched("s-old", "codex-cli", true)
+            launched("s-old", "codex-cli", Mode::Fork)
+        );
+    }
+
+    /// A refresh landing while the transcript is open can move the list
+    /// selection; the keys still act on the session being read.
+    #[test]
+    fn pager_keys_act_on_the_session_being_read() {
+        let api = MockApi::golden();
+        let mut app = opened(&api, 100, 12);
+        press(&mut app, &api, KeyCode::Down);
+        press(&mut app, &api, KeyCode::Enter);
+        assert_eq!(app.pager.as_ref().unwrap().session_id, "s-old");
+        app.listing_state.select(Some(0));
+        assert_eq!(
+            press(&mut app, &api, KeyCode::Char('f')),
+            launched("s-old", "codex-cli", Mode::Fork)
         );
     }
 

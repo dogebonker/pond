@@ -13,7 +13,6 @@ title = "pond: session desk"
 contexts = ["pane", "workspace"]
 command = ["bin/herdr-pond", "open"]
 
-# Stores the focused agent's session, then closes its pane.
 [[actions]]
 id = "park"
 title = "pond: park this agent"

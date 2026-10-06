@@ -21,8 +21,10 @@ const DESK_ENTRYPOINT: &str = "desk";
 const DESK_LABEL: &str = "pond desk";
 /// herdr answers in milliseconds; a hung CLI must not hang a hook or the desk.
 const CALL_DEADLINE: Duration = Duration::from_secs(3);
-/// `agent start` waits for the agent to be ready, up to herdr's own 30s default.
-const AGENT_START_DEADLINE: Duration = Duration::from_secs(35);
+/// How long `agent start` waits for the agent to be ready; the CLI call gets a
+/// little longer, so herdr's own timeout always answers first.
+const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const AGENT_START_DEADLINE: Duration = Duration::from_secs(AGENT_READY_TIMEOUT.as_secs() + 5);
 const CALL_POLL: Duration = Duration::from_millis(5);
 
 /// A plugin-runtime path herdr sets for every plugin process.
@@ -240,7 +242,6 @@ impl Herdr {
         self.call(&["pane", "close", pane_id]).map(drop)
     }
 
-    /// Opens a focused tab and returns its root pane.
     pub(crate) fn tab_create(
         &self,
         workspace: Option<&str>,
@@ -258,7 +259,6 @@ impl Herdr {
             .context("herdr tab create: no root pane in the response")
     }
 
-    /// Starts `kind` in `pane_id` and waits until herdr detects it ready.
     pub(crate) fn agent_start(
         &self,
         name: &str,
@@ -266,8 +266,18 @@ impl Herdr {
         pane_id: &str,
         agent_args: &[String],
     ) -> anyhow::Result<()> {
+        let timeout = AGENT_READY_TIMEOUT.as_millis().to_string();
         let mut args = vec![
-            "agent", "start", name, "--kind", kind, "--pane", pane_id, "--",
+            "agent",
+            "start",
+            name,
+            "--kind",
+            kind,
+            "--pane",
+            pane_id,
+            "--timeout",
+            &timeout,
+            "--",
         ];
         args.extend(agent_args.iter().map(String::as_str));
         Self {
@@ -470,6 +480,37 @@ esac"#,
             &format!("cat '{}'", sandbox.path("panes.json").display()),
         );
         assert_eq!(Herdr::new(bin).pane_list(None).unwrap().len(), 2000);
+    }
+
+    /// The desk spawns its launch leg as its pane closes; a leg sharing the
+    /// desk's process group dies in that teardown before it can detach.
+    #[test]
+    fn a_detached_leg_runs_in_its_own_process_group() {
+        let sandbox = Sandbox::new();
+        let pid_file = sandbox.path("pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!("echo $$ > '{}'; exec sleep 5", pid_file.display()));
+        spawn_detached(command, &sandbox.path("log")).unwrap();
+        let started = Instant::now();
+        let pid = loop {
+            if let Some(pid) = fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+            {
+                break nix::unistd::Pid::from_raw(pid);
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the leg never ran"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let group = nix::unistd::getpgid(Some(pid)).unwrap();
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        assert_eq!(group, pid, "the leg leads its own group");
+        assert_ne!(group, nix::unistd::getpgid(None).unwrap());
     }
 
     #[test]

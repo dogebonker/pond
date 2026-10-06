@@ -743,7 +743,8 @@ enum Command {
 --out-dir is the directory the adapter's own layout is rooted at, so for
 pi-coding-agent that is ~/.pi/agent and the files land in sessions/<slug>/.
 --out-dir native picks that directory for you, from the adapter's configured
-path (claude-code, codex-cli, pi-coding-agent).")]
+or default source path; an adapter without one exits 2 (use ./native for a
+directory literally named native).")]
     #[command(display_order = 14)]
     Resume {
         /// Session id (from `pond search`).
@@ -2183,8 +2184,11 @@ async fn run_resume(
     config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let json = matches!(format, OutputFormat::Json);
-    let fail = |code: i32, doc: serde_json::Value, text: String| -> anyhow::Result<()> {
+    // The JSON document carries the text too: a plugin toasting the error has
+    // nothing else that names the fix.
+    let fail = |code: i32, mut doc: serde_json::Value, text: String| -> anyhow::Result<()> {
         if json {
+            doc["message"] = serde_json::Value::String(text);
             output(&serde_json::to_string_pretty(&doc)?)?;
         } else {
             output_err(&text)?;
@@ -2215,7 +2219,8 @@ async fn run_resume(
     }
 
     let loaded = Config::load(config_path(config))?;
-    let out_dir = if out_dir == Path::new("native") {
+    // The raw argument, not `Path` equality, which would also take `native/`.
+    let out_dir = if out_dir.as_os_str() == "native" {
         match native_out_dir(factory, &loaded) {
             Some(dir) => dir,
             None => {
@@ -2268,14 +2273,14 @@ async fn run_resume(
         }
     };
 
-    // Fidelity is the system's decision, never the caller's: same origin means
-    // a value-complete replay is available (`source_agent` is exact-or-subpath,
-    // so a subagent of the target client counts as native).
     // The requested session's own project: a caller launching the client on
     // the resumed files runs it there.
     let project = sessions
         .first()
         .map(|session| session.session.project.clone());
+    // Fidelity is the system's decision, never the caller's: same origin means
+    // a value-complete replay is available (`source_agent` is exact-or-subpath,
+    // so a subagent of the target client counts as native).
     let mut planned = Vec::with_capacity(sessions.len());
     for session in &sessions {
         let files = factory.serialize(
@@ -2425,20 +2430,21 @@ async fn run_resume(
 
 /// `pond resume --out-dir native`: the adapter's configured source `path`, else
 /// the one its probe finds, mapped to where its restored layout is rooted. A
-/// multi-path config has no single answer, so it resolves to `None`.
+/// multi-path config has no single answer, and a source that is not an
+/// existing directory means the client is not here, so both resolve to `None`.
 fn native_out_dir(factory: &dyn adapter::AdapterFactory, loaded: &Config) -> Option<PathBuf> {
-    let configured = loaded
+    let source = match loaded
         .adapters
         .get(factory.name())
-        .and_then(|blob| blob.get("path"));
-    let source = match configured {
-        Some(path) => PathBuf::from(path.as_str()?),
-        None => {
-            let probed = factory.probe_default(&adapter::Env::from_env()?)?;
-            PathBuf::from(probed.get("path")?.as_str()?)
-        }
+        .filter(|blob| blob.get("path").is_some())
+    {
+        Some(blob) => source_root(blob)?,
+        None => source_root(&factory.probe_default(&adapter::Env::from_env()?)?)?,
     };
-    factory.native_restore_root(&adapter::expand_home(source))
+    if !(source.is_absolute() && source.is_dir()) {
+        return None;
+    }
+    factory.native_restore_root(&source)
 }
 
 /// Did this session come from the adapter being resumed into? The same

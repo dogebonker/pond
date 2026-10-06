@@ -28,7 +28,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::types::{DeskContext, DeskExit};
 
 const USAGE: &str = "usage: herdr-pond open|tui|hook [--worker <adapter>]|serve-daemon [--owner]\
-                     |launch <session-id> <adapter> [--fork]|park [--worker <pane> <adapter>]";
+                     |launch <session-id> <adapter> [--fork|--hand-off]|park [--worker <pane> <adapter>]";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();

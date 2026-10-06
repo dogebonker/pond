@@ -4,6 +4,8 @@ Goal: give the v1 desk ([2609-24-herdr-pond-v1-desk-plan.md](2609-24-herdr-pond-
 
 Status: implemented on top of PR #312, for the owner's review. It reconciles the parked half of [2609-02](2609-02-herdr-pond-plugin-spec-and-plan.md) with the decisions v1 locked in. Each `Q` in section 7 was implemented with the proposed answer, and each is cheap to reverse in review. Grounded in the v1 code at `feat/herdr-pond-desk` and herdr 0.9.3.
 
+Phase 0 results (2026-10-06, herdr 0.9.3, a real local store): `o` resumed a Codex and a Claude Code session in a new tab in the session's project, and herdr reported the agent on the same session id, which confirms the codex rollout id mapping. A second Claude resume took the exit-3 path and still launched. `f` came up on a new session id and left the original file untouched. `h` from Codex to Claude Code wrote a reconstruction that Claude loaded. Park synced and closed the pane. The run found two bugs, both fixed: the desk pane's teardown killed the launch leg before it detached (`spawn_detached` now uses `process_group(0)`), and herdr rejects agent names with spaces.
+
 ## 1. What changed since 2609-02
 
 | 2609-02 assumed | v1 / today | Consequence for v2 |
@@ -17,7 +19,7 @@ Status: implemented on top of PR #312, for the owner's review. It reconciles the
 
 ## 2. Product surface
 
-### 2.1 Keys (proposed, pending Q1)
+### 2.1 Keys (Q1)
 
 | Key | Live row | Any other row (local or remote) |
 |---|---|---|
@@ -30,21 +32,21 @@ Status: implemented on top of PR #312, for the owner's review. It reconciles the
 
 ### 2.2 Park (a herdr action, not a desk key)
 
-`[[actions]] park`, context `pane`: run `pond sync <adapter>` in the foreground, so the session is stored before the pane dies. Refuse while the agent is `working` (Q4). Then `herdr pane close`. pond is the registry: a parked session is just an idle row in the desk, so there is no marker pane and no registry file.
+`[[actions]] park`, context `pane`: run `pond sync <adapter>` in a detached worker, then `herdr pane close`, so the session is stored before the pane dies. Only an agent waiting for input (`idle` or `done`) is parked (Q4), and it is checked again after the sync, since the sync can wait behind another one while the user types a new prompt. pond is the registry: a parked session is just an idle row in the desk, so there is no marker pane and no registry file.
 
 ### 2.3 Where the new tab lands
 
 - New tab in the focused workspace. cwd = the session's `project` (reported by `pond resume`) when that path exists on this host.
 - Otherwise, typically a session from another machine, the cwd is the desk's own project. Basename mapping (2609-02 2.5) is not built: it needs a search root nobody has configured (Q3).
-- Tab label: `<kind> <resume|fork> <first 8 chars of the id>`.
+- Tab label: `<kind> <resume|fork|hand off> <first 8 chars of the id>`. The herdr agent name adds the new pane's id, because herdr requires names unique among live agents and two forks of one session would otherwise collide.
 
 ## 3. Mechanics
 
 ### 3.1 Desk exits, a headless leg acts
 
-v1 already exits the desk through `DeskExit::Jump { pane_id }` and runs the jump after the terminal is restored. v2 adds one variant on the same path: `DeskExit::Launch(Launch { session_id, adapter, fork })`. Resume, fork and hand-off are all this one shape. A hand-off is a resume whose `adapter` is not the session's own.
+v1 already exits the desk through `DeskExit::Jump { pane_id }` and runs the jump after the terminal is restored. v2 adds one variant on the same path: `DeskExit::Launch(Launch { session_id, adapter, mode })`, with `mode` one of resume, fork or hand-off. A hand-off is a resume whose `adapter` is not the session's own. In the pager, the keys act on the session being read, not the list selection, which a refresh can move.
 
-After restore, `main.rs` spawns a detached `herdr-pond launch <id> <adapter> [--fork]` (v1's `spawn_detached`) and exits, so the overlay closes at once. The leg reports failure as a herdr toast (`notification show`) and a line in `launch.log`, the same channels v1's headless legs use.
+After restore, `main.rs` spawns a detached `herdr-pond launch <id> <adapter> [--fork|--hand-off]` (v1's `spawn_detached`) and exits, so the overlay closes at once. The leg reports failure as a herdr toast (`notification show`) and a line in `launch.log`, the same channels v1's headless legs use.
 
 Hand-off needs a target picker before the desk exits: a small list overlay of the launch table's clients other than the session's own. The desk owns it as one more modal state beside the pager. A client that is not installed fails at `agent start`, and that failure is toasted.
 
@@ -66,7 +68,7 @@ herdr agent start <label> --kind <kind> --pane P -- <args...>
 
 ### 3.4 Launch table (`src/launch.rs`)
 
-`{id}` is the resumed session's id. `{path}` is the first file `pond resume` reported (on exit 3, the first `existing` path).
+`{id}` is the resumed session's id. `{path}` is the session's own file: the first `pond resume` wrote, or on exit 3 the `existing` path named for the session (a launch that needs `{path}` refuses when only lineage files exist). The `--kind` column is not stored in the table: it comes from the hook's agent-to-adapter map, so the two cannot drift.
 
 | pond adapter | `--kind` | resume args | native fork args |
 |---|---|---|---|
@@ -86,7 +88,7 @@ These are the three adapters that implement `native_restore_root` (section 4). T
 
 - **Phase 0, verify (half a day).** For claude-code and codex-cli, on this machine: `pond resume --to <a> --out-dir <native dir>`, then the resume args through `herdr agent start` in a scratch tab. Check that a rematerialized file resumes, and that a second resume returns exit 3 and still launches. Check native fork on a rematerialized file. Confirm the codex rollout id matches pond's `codex-cli` session id. Record the results at the top of this doc.
 - **Built in one PR into `feat/herdr-pond-desk`:** the pond change (section 4) with an integration test in `tests/integration/resume.rs` (native root resolved from the probe under a sandbox HOME, `project` reported on exit 0 and 3, `no_native_dir`). Plus herdr-pond's `launch.rs` (table, launch leg, park), `DeskExit::Launch`, the hand-off picker, and the `park` action. Tests extend v1's fake-pond/fake-herdr scripts: resume exit 0 / 3 / 2, unknown client, a cwd that falls back for a project missing on this host, park refusing a working or unknown agent, and park closing the pane only after a successful sync. Desk tests cover `o` / `f` / `h` on live and idle rows, in the pager, and on a session the desk cannot start.
-- **Not yet done: phase 0 on a live herdr.** The launch path is tested against fake herdr and pond scripts only.
+- **Hardened after a pre-merge review:** a resume re-checks herdr's live panes and focuses a running agent instead of starting a second writer on its file; on exit 3 only a file named for the session itself is used for `{path}`, never a surviving child's; a failed `agent start` closes the tab it opened (except `agent_not_ready`, where herdr keeps the agent); a hand-off toasts the fidelity served; pond's JSON error documents carry the message that names the fix; `native` refuses a configured source that is not an existing directory, and codex/pi map only a `sessions` directory.
 
 ## 6. Still parked
 
@@ -100,6 +102,6 @@ These are the three adapters that implement `native_restore_root` (section 4). T
 - **Q1.** Keys: implemented as v1's Enter = read, plus `o` / `f` / `h`. Or switch to 2609-02's Enter = resume, Space = read?
 - **Q2.** `native` as a keyword on `--out-dir` (implemented, after the `local` precedent), or a separate `--native` flag?
 - **Q3.** Sessions whose project is missing here: implemented as falling back to the desk's project. Basename mapping waits for git-remote-at-ingest.
-- **Q4.** Park on a `working` agent: implemented as refuse with a toast. Or confirm?
+- **Q4.** Park on a busy agent (`working`, `blocked` or `unknown`): implemented as refuse with a toast. Or confirm?
 - **Q5.** Per-harness launch overrides in plugin config: not built. Wait until someone needs one?
 - **Q6.** `herdr agent start` is verified on herdr 0.9.3. Should `min_herdr_version` move from 0.9.1 to the release that introduced it?
