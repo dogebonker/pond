@@ -696,12 +696,8 @@ mod unix {
         Some(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    /// A timer can be `enabled` and `active` with no next elapse, never
-    /// firing again - and `Persistent=true` is what causes it: its stamp
-    /// disables the already-past `OnBootSec=` one-shot on a fresh user
-    /// manager while `OnUnitActiveSec=` has no base (timer.c: the stamp load
-    /// in `timer_start`, the skips in `timer_enter_waiting`). `is-enabled`
-    /// still succeeds, so the elapse properties are the only honest probe.
+    /// Old monotonic registrations can lose their service activation anchor
+    /// after a user-manager restart. Enablement alone cannot prove recurrence.
     fn systemd_timer_problem(show: &str) -> Option<String> {
         timer_is_dead(show).then(|| {
             "the timer has no next elapse and will never fire again \
@@ -768,6 +764,16 @@ mod unix {
         )
     }
 
+    fn systemd_calendar(every: ScheduleEvery) -> &'static str {
+        match every {
+            ScheduleEvery::M5 => "*-*-* *:0/5:00",
+            ScheduleEvery::M15 => "*-*-* *:0/15:00",
+            ScheduleEvery::H1 => "*-*-* *:00:00",
+            ScheduleEvery::H6 => "*-*-* 0/6:00:00",
+            ScheduleEvery::D1 => "*-*-* 00:00:00",
+        }
+    }
+
     fn systemd_timer_body(every: ScheduleEvery) -> String {
         format!(
             "# created and maintained by pond; edits may be replaced\n\
@@ -775,12 +781,12 @@ mod unix {
              Description=pond sync every {}\n\n\
              [Timer]\n\
              OnBootSec=2m\n\
-             OnUnitActiveSec={}s\n\
+             OnCalendar={}\n\
              Persistent=true\n\n\
              [Install]\n\
              WantedBy=timers.target\n",
             every.label(),
-            every.secs(),
+            systemd_calendar(every),
         )
     }
 
@@ -819,7 +825,8 @@ mod unix {
             .with_context(|| format!("failed to write {}", timer_path.display()))?;
         for args in [
             vec!["--user", "daemon-reload"],
-            vec!["--user", "enable", "--now", "pond-sync.timer"],
+            vec!["--user", "enable", "pond-sync.timer"],
+            vec!["--user", "restart", "pond-sync.timer"],
         ] {
             let output = Command::new("systemctl")
                 .args(&args)
@@ -834,11 +841,8 @@ mod unix {
                 );
             }
         }
-        // `enable --now` cannot revive a dead timer - a start job on an
-        // active (`elapsed`) unit is a no-op and `timer_trigger_notify`
-        // ignores dead/failed; only a fresh service activation re-anchors
-        // `OnUnitActiveSec=`. `--no-block` keeps the triggered sync from
-        // holding this command open.
+        // Repair also kicks off a sync now rather than waiting for a calendar
+        // boundary. `--no-block` keeps registration from waiting for the sync.
         if needs_repair {
             let output = Command::new("systemctl")
                 .args(["--user", "start", "--no-block", "pond-sync.service"])
@@ -899,6 +903,24 @@ mod unix {
 
     fn read_systemd_interval() -> Option<ScheduleEvery> {
         let body = std::fs::read_to_string(systemd_unit_dir().join("pond-sync.timer")).ok()?;
+        systemd_interval(&body)
+    }
+
+    fn systemd_interval(body: &str) -> Option<ScheduleEvery> {
+        if let Some(calendar) = body
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("OnCalendar="))
+        {
+            return [
+                ScheduleEvery::M5,
+                ScheduleEvery::M15,
+                ScheduleEvery::H1,
+                ScheduleEvery::H6,
+                ScheduleEvery::D1,
+            ]
+            .into_iter()
+            .find(|every| systemd_calendar(*every) == calendar.trim());
+        }
         let line = body
             .lines()
             .find_map(|line| line.trim().strip_prefix("OnUnitActiveSec="))?;
@@ -1091,6 +1113,43 @@ mod unix {
         const LOG: &str = "/tmp/sync.log";
         const STATE: &str = "/home/user/.local/state";
         const CONFIG: &str = "/home/user/.config/pond/config.toml";
+
+        #[test]
+        fn systemd_timers_use_persistent_calendar_recurrence() {
+            for (every, calendar) in [
+                (ScheduleEvery::M5, "*-*-* *:0/5:00"),
+                (ScheduleEvery::M15, "*-*-* *:0/15:00"),
+                (ScheduleEvery::H1, "*-*-* *:00:00"),
+                (ScheduleEvery::H6, "*-*-* 0/6:00:00"),
+                (ScheduleEvery::D1, "*-*-* 00:00:00"),
+            ] {
+                let body = systemd_timer_body(every);
+                assert!(body.contains(&format!("OnCalendar={calendar}\n")), "{body}");
+                assert!(body.contains("OnBootSec=2m\n"), "{body}");
+                assert!(body.contains("Persistent=true\n"), "{body}");
+                assert!(!body.contains("OnUnitActiveSec="), "{body}");
+                assert_eq!(systemd_interval(&body), Some(every));
+            }
+        }
+
+        #[test]
+        fn systemd_interval_reads_unrepaired_units_and_rejects_unknown_cadences() {
+            for every in [
+                ScheduleEvery::M5,
+                ScheduleEvery::M15,
+                ScheduleEvery::H1,
+                ScheduleEvery::H6,
+                ScheduleEvery::D1,
+            ] {
+                assert_eq!(
+                    systemd_interval(&format!("OnUnitActiveSec={}s\n", every.secs())),
+                    Some(every)
+                );
+            }
+            for body in ["", "OnUnitActiveSec=123s", "OnCalendar=weekly"] {
+                assert_eq!(systemd_interval(body), None, "{body}");
+            }
+        }
 
         /// Captured verbatim from `systemctl --user show` (systemd 259,
         /// Ubuntu 24.04) on a timer carrying pond's exact generated body
