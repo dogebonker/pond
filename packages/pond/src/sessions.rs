@@ -3781,7 +3781,7 @@ impl Store {
             .await
             .with_context(|| {
                 format!(
-                    "{} re-encode stopped; fragments already rewritten are kept, and `pond optimize --full` rewrites only the ones still in the legacy layout",
+                    "{} re-encode stopped; fragments already rewritten are kept - resume with `pond optimize --full`, which rewrites only the fragments still in the legacy layout (a `--reencode` re-run starts the whole table over)",
                     table.as_str()
                 )
             });
