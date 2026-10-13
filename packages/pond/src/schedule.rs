@@ -56,8 +56,9 @@ impl ScheduleEvery {
     }
 
     fn from_secs(secs: u32) -> Option<Self> {
-        [Self::M5, Self::M15, Self::H1, Self::H6, Self::D1]
-            .into_iter()
+        Self::value_variants()
+            .iter()
+            .copied()
             .find(|every| every.secs() == secs)
     }
 }
@@ -374,6 +375,7 @@ mod unix {
     use std::process::{Command, Stdio};
 
     use anyhow::{Context, Result, bail};
+    use clap::ValueEnum;
 
     use super::{ScheduleEvery, State};
     use State::{Active, Inactive};
@@ -770,11 +772,12 @@ mod unix {
             ScheduleEvery::M15 => "*-*-* *:0/15:00",
             ScheduleEvery::H1 => "*-*-* *:00:00",
             ScheduleEvery::H6 => "*-*-* 0/6:00:00",
-            ScheduleEvery::D1 => "*-*-* 00:00:00",
+            ScheduleEvery::D1 => "*-*-* 03:00:00",
         }
     }
 
     fn systemd_timer_body(every: ScheduleEvery) -> String {
+        // Half-cadence jitter leaves room for systemd's default accuracy window.
         format!(
             "# created and maintained by pond; edits may be replaced\n\
              [Unit]\n\
@@ -782,11 +785,14 @@ mod unix {
              [Timer]\n\
              OnBootSec=2m\n\
              OnCalendar={}\n\
+             RandomizedDelaySec={}s\n\
+             FixedRandomDelay=true\n\
              Persistent=true\n\n\
              [Install]\n\
              WantedBy=timers.target\n",
             every.label(),
             systemd_calendar(every),
+            (every.secs() / 2).min(ScheduleEvery::H1.secs()),
         )
     }
 
@@ -823,6 +829,7 @@ mod unix {
             .with_context(|| format!("failed to write {}", service_path.display()))?;
         std::fs::write(&timer_path, timer)
             .with_context(|| format!("failed to write {}", timer_path.display()))?;
+        // enable --now cannot revive an active elapsed timer; restart re-arms it.
         for args in [
             vec!["--user", "daemon-reload"],
             vec!["--user", "enable", "pond-sync.timer"],
@@ -911,15 +918,10 @@ mod unix {
             .lines()
             .find_map(|line| line.trim().strip_prefix("OnCalendar="))
         {
-            return [
-                ScheduleEvery::M5,
-                ScheduleEvery::M15,
-                ScheduleEvery::H1,
-                ScheduleEvery::H6,
-                ScheduleEvery::D1,
-            ]
-            .into_iter()
-            .find(|every| systemd_calendar(*every) == calendar.trim());
+            return ScheduleEvery::value_variants()
+                .iter()
+                .copied()
+                .find(|every| systemd_calendar(*every) == calendar.trim());
         }
         let line = body
             .lines()
@@ -1121,7 +1123,7 @@ mod unix {
                 (ScheduleEvery::M15, "*-*-* *:0/15:00"),
                 (ScheduleEvery::H1, "*-*-* *:00:00"),
                 (ScheduleEvery::H6, "*-*-* 0/6:00:00"),
-                (ScheduleEvery::D1, "*-*-* 00:00:00"),
+                (ScheduleEvery::D1, "*-*-* 03:00:00"),
             ] {
                 let body = systemd_timer_body(every);
                 assert!(body.contains(&format!("OnCalendar={calendar}\n")), "{body}");
@@ -1129,6 +1131,25 @@ mod unix {
                 assert!(body.contains("Persistent=true\n"), "{body}");
                 assert!(!body.contains("OnUnitActiveSec="), "{body}");
                 assert_eq!(systemd_interval(&body), Some(every));
+            }
+        }
+
+        #[test]
+        fn systemd_timers_spread_hosts_with_a_fixed_delay_below_the_cadence() {
+            for every in ScheduleEvery::value_variants().iter().copied() {
+                let body = systemd_timer_body(every);
+                let delay = body
+                    .lines()
+                    .find_map(|line| line.strip_prefix("RandomizedDelaySec="))
+                    .and_then(|value| value.strip_suffix('s'))
+                    .and_then(|value| value.parse::<u32>().ok());
+                assert!(
+                    delay.is_some_and(|secs| secs > 0
+                        && secs <= every.secs() / 2
+                        && secs <= ScheduleEvery::H1.secs()),
+                    "{body}"
+                );
+                assert!(body.contains("FixedRandomDelay=true\n"), "{body}");
             }
         }
 

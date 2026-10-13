@@ -7354,7 +7354,7 @@ struct LocalStatus {
     /// active/backend/cadence fields (JSON emits those directly).
     schedule: crate::schedule::ScheduleSnapshot,
     /// Estimated seconds until the next scheduled sync (negative = overdue).
-    /// `None` for systemd calendar timers or without a last-sync anchor.
+    /// `None` without an active schedule or a last-sync record to anchor on.
     /// An estimate only: it anchors on the last recorded sync (manual or
     /// scheduled), while the OS timer ticks on its own clock.
     next_run_secs: Option<i64>,
@@ -7370,14 +7370,13 @@ async fn local_status(
     store_key: &str,
     schedule: crate::schedule::ScheduleSnapshot,
 ) -> LocalStatus {
-    // Calendar boundaries cannot be estimated from the last sync's finish.
-    // Broken registrations also get no estimate, in both text and JSON.
+    // A broken registration will not fire, so it gets no next-run estimate -
+    // gated here at derivation so the text and JSON surfaces agree.
     let active_every = schedule
         .problem
         .is_none()
         .then_some(schedule.every)
-        .flatten()
-        .filter(|_| schedule.backend != Some("systemd"));
+        .flatten();
     let hostname = whoami::hostname().ok();
     // Freshness verdicts come from the rowmap chain cached at this host's
     // last sync - exactly the baseline "pending since then" wants. It costs one
