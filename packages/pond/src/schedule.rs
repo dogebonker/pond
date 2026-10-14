@@ -106,6 +106,8 @@ pub(crate) struct ScheduleSnapshot {
     /// A registered schedule that cannot run (e.g. the task's launcher path
     /// no longer exists after a reinstall); the text names the fix.
     pub problem: Option<String>,
+    /// When the scheduler itself reports its next firing (systemd only).
+    pub next_run: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 // ===========================================================================
@@ -119,6 +121,7 @@ enum State {
         every: Option<ScheduleEvery>,
         /// Registered but unable to run.
         problem: Option<String>,
+        next_run: Option<chrono::DateTime<chrono::Utc>>,
     },
     Inactive,
 }
@@ -133,6 +136,7 @@ impl State {
             backend,
             every,
             problem: None,
+            next_run: None,
         }
     }
 }
@@ -143,6 +147,7 @@ fn render_state(state: &State) -> String {
             backend,
             every,
             problem,
+            ..
         } => {
             let cadence = every
                 .map(|every| format!(", every {}", every.label()))
@@ -172,13 +177,14 @@ pub(crate) fn log_path() -> PathBuf {
 pub(crate) fn status_snapshot() -> ScheduleSnapshot {
     match platform_probe() {
         Ok(state) => {
-            let (active, backend, every, problem) = match &state {
+            let (active, backend, every, problem, next_run) = match &state {
                 Active {
                     backend,
                     every,
                     problem,
-                } => (true, Some(*backend), *every, problem.clone()),
-                Inactive => (false, None, None, None),
+                    next_run,
+                } => (true, Some(*backend), *every, problem.clone(), *next_run),
+                Inactive => (false, None, None, None, None),
             };
             ScheduleSnapshot {
                 line: render_state(&state),
@@ -186,6 +192,7 @@ pub(crate) fn status_snapshot() -> ScheduleSnapshot {
                 backend,
                 every,
                 problem,
+                next_run,
             }
         }
         Err(_) => ScheduleSnapshot {
@@ -197,6 +204,7 @@ pub(crate) fn status_snapshot() -> ScheduleSnapshot {
             backend: None,
             every: None,
             problem: None,
+            next_run: None,
         },
     }
 }
@@ -395,6 +403,7 @@ mod unix {
                         problem: systemd_timer_show()
                             .as_deref()
                             .and_then(systemd_timer_problem),
+                        next_run: systemd_next_elapse(),
                     });
                 }
                 if let Some(entry) = read_cron_fence_entry()? {
@@ -696,6 +705,34 @@ mod unix {
             return None;
         }
         Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// The timer's own next firing, randomized delay included. Read raw over
+    /// D-Bus because `systemctl show` renders it in the host's zone, ignoring
+    /// `--timestamp=`, so its text has no portable parse.
+    fn systemd_next_elapse() -> Option<chrono::DateTime<chrono::Utc>> {
+        let output = Command::new("busctl")
+            .args([
+                "--user",
+                "get-property",
+                "org.freedesktop.systemd1",
+                "/org/freedesktop/systemd1/unit/pond_2dsync_2etimer",
+                "org.freedesktop.systemd1.Timer",
+                "NextElapseUSecRealtime",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        next_elapse_from_busctl(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    /// `busctl` answers `t <usec>`; 0 and `u64::MAX` mean nothing is armed.
+    fn next_elapse_from_busctl(reply: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        let usec: u64 = reply.trim().strip_prefix("t ")?.parse().ok()?;
+        let usec = i64::try_from(usec).ok().filter(|usec| *usec > 0)?;
+        chrono::DateTime::from_timestamp_micros(usec)
     }
 
     /// Old monotonic registrations can lose their service activation anchor
@@ -1227,6 +1264,19 @@ mod unix {
             ));
         }
 
+        #[test]
+        fn next_elapse_is_read_only_from_an_armed_busctl_reply() {
+            assert_eq!(
+                next_elapse_from_busctl("t 1791949277000000\n"),
+                chrono::DateTime::parse_from_rfc3339("2026-10-14T03:41:17Z")
+                    .ok()
+                    .map(|at| at.to_utc()),
+            );
+            for reply in ["t 0\n", "t 18446744073709551615\n", "", "s \"n/a\"\n"] {
+                assert_eq!(next_elapse_from_busctl(reply), None, "{reply}");
+            }
+        }
+
         /// The Windows precedent (`launcher_problem_flags_only_a_missing_command`)
         /// pins that a problem message names its fix; this pins the same.
         #[test]
@@ -1353,6 +1403,7 @@ mod windows {
             backend: "task-scheduler",
             every: parse_interval_from_xml(&xml),
             problem: launcher_problem(&xml),
+            next_run: None,
         })
     }
 
